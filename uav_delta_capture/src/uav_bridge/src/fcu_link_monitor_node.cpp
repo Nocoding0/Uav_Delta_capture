@@ -27,7 +27,7 @@ public:
     ok_threshold_count_ = std::max(1, ok_threshold_count_);
 
     pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
-      local_pose_topic_, 20,
+      local_pose_topic_, rclcpp::SensorDataQoS(),
       std::bind(&FcuLinkMonitorNode::poseCallback, this, std::placeholders::_1));
 
     status_pub_ = create_publisher<std_msgs::msg::String>(status_topic_, 10);

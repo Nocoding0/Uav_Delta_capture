@@ -9,7 +9,8 @@ uav_delta_capture/src/
 ├── uav_delta_msgs/      # 自定义消息 (GraspTarget.msg, SetArmStatus.srv)
 ├── delta_kinematics/    # Delta 机构运动学节点 (C++, Eigen)
 ├── perception_logic/    # 视觉感知原型 (Python, 预留 NPU)
-└── uav_bridge/          # MAVROS/TF2 桥接 (C++)
+├── uav_bridge/          # MAVROS/TF2 桥接 (C++)
+└── vision_test/         # 视觉推理测试 (Python, stai_mpu NPU / onnxruntime)
 ```
 
 ## 构建和运行
@@ -42,7 +43,33 @@ docker exec -it ros2humble bash -c "
 
 ## 依赖
 
-rclcpp, geometry_msgs, tf2, tf2_ros, mavros, eigen3, sensor_msgs, std_msgs
+rclcpp, geometry_msgs, tf2, tf2_ros, mavros, eigen3, sensor_msgs, std_msgs, stai_mpu (vision_test)
+
+## vision_test 视觉推理测试
+
+构建并运行：
+```bash
+docker exec -it ros2humble bash -c "
+  cd /workspace/uav_delta_capture &&
+  source /opt/ros/humble/setup.bash &&
+  colcon build --packages-select vision_test --symlink-install --parallel-workers 1 &&
+  source install/setup.bash &&
+  ros2 launch vision_test vision_test.launch.py
+"
+```
+
+直接在板子上运行（不依赖 Docker）：
+```bash
+cd /usr/local/Uav_Delta_capture/uav_delta_capture
+python3 -m vision_test.bench_node --ros-args -p use_npu:=true
+```
+
+参数：
+- `mode:=synthetic`（默认）合成图像测试 | `mode:=subscribe` 订阅真实相机
+- `input_size:=320` 推理输入分辨率
+- `use_npu:=true`（默认）使用 stai_mpu NPU 加速
+- `num_iterations:=100` 推理轮数
+- `model_path:=` 模型路径（默认 .nb NPU 模型）
 
 ## 注意事项
 

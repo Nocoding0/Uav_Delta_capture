@@ -1,0 +1,46 @@
+uwb_navigator_node:
+  ros__parameters:
+    # Serial port to DWM1001
+    serial_port: /dev/ttyACM1
+    serial_baud: 115200
+
+    # UWB frame
+    uwb_frame_id: uwb
+
+    # Topics
+    cmd_vel_topic: cmd_vel
+    fcu_state_topic: fcu_state
+    uwb_status_topic: uwb/status
+    target_reached_topic: uwb/target_reached
+
+    # Target position (UWB frame, meters)
+    target_x: 2.5
+    target_y: 3.0
+    target_z: 1.2
+
+    # Controller gains
+    kp_xy: 0.8
+    kp_z: 0.6
+
+    # Velocity limits (must be within flight_commander_node clamps)
+    max_vel_xy: 0.8
+    max_vel_z: 0.4
+
+    # Deadband (meters)
+    deadband_radius: 0.10
+
+    # Rate limiting (m/s^2)
+    max_accel_xy: 0.5
+    max_accel_z: 0.3
+
+    # Control loop rate
+    control_rate_hz: 20.0
+
+    # Safety
+    signal_loss_timeout_sec: 0.5
+    max_range_xy: 15.0
+    max_range_z: 5.0
+    min_z: 0.3
+
+    # Status publish rate
+    status_rate_hz: 10.0

@@ -19,6 +19,8 @@ def generate_launch_description():
                 'use_mock_fcu': 'false',
                 'start_mavros': 'true',
                 'start_fcu_guard': 'true',
+                'start_fcu_state': 'true',
+                'start_commander': 'true',
                 'delta_target_topic': 'target_point_safe',
             }.items(),
         ),

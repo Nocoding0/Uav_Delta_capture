@@ -35,12 +35,14 @@ public:
     tf_buffer_(get_clock()),
     tf_listener_(tf_buffer_)
   {
+    const auto best_effort = rclcpp::SensorDataQoS();
+
     local_pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
-      local_pose_topic_, 20,
+      local_pose_topic_, best_effort,
       std::bind(&UavBridgeNode::localPoseCallback, this, std::placeholders::_1));
 
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
-      imu_topic_, 50,
+      imu_topic_, best_effort,
       std::bind(&UavBridgeNode::imuCallback, this, std::placeholders::_1));
 
     vision_offset_sub_ = create_subscription<geometry_msgs::msg::PointStamped>(

@@ -1,0 +1,13 @@
+fcu_state_node:
+  ros__parameters:
+    state_topic: /mavros/state
+    battery_topic: /mavros/battery
+    gps_topic: /mavros/gpsstatus/gps1/raw
+    ekf_topic: /mavros/estimator_status
+    pose_topic: /mavros/local_position/pose
+    output_topic: fcu_state
+    publish_rate_hz: 10.0
+    use_mock: false
+    mock_mode: "GUIDED"
+    mock_armed: false
+    mock_altitude: 1.0

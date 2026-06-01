@@ -21,3 +21,11 @@ __pycache__/
 .DS_Store
 Thumbs.db
 *.swp
+
+# Large files (models, reference materials)
+models/
+uwb-reference/
+
+# Sensitive files
+*.token
+.env

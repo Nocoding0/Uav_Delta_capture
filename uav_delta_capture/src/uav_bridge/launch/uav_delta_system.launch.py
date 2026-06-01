@@ -43,6 +43,26 @@ def generate_launch_description():
         'config',
         'mavros_bridge.yaml'
     )
+    fcu_state_default = os.path.join(
+        get_package_share_directory('uav_bridge'),
+        'config',
+        'fcu_state.yaml'
+    )
+    commander_default = os.path.join(
+        get_package_share_directory('uav_bridge'),
+        'config',
+        'flight_commander.yaml'
+    )
+    uwb_navigator_default = os.path.join(
+        get_package_share_directory('uav_bridge'),
+        'config',
+        'uwb_navigator.yaml'
+    )
+    mission_sequencer_default = os.path.join(
+        get_package_share_directory('uav_bridge'),
+        'config',
+        'mission_sequencer.yaml'
+    )
 
     delta_params = LaunchConfiguration('delta_params')
     perception_params = LaunchConfiguration('perception_params')
@@ -51,9 +71,17 @@ def generate_launch_description():
     health_params = LaunchConfiguration('health_params')
     failsafe_params = LaunchConfiguration('failsafe_params')
     mavros_params = LaunchConfiguration('mavros_params')
+    fcu_state_params = LaunchConfiguration('fcu_state_params')
+    commander_params = LaunchConfiguration('commander_params')
+    uwb_navigator_params = LaunchConfiguration('uwb_navigator_params')
+    mission_sequencer_params = LaunchConfiguration('mission_sequencer_params')
     use_mock_fcu = LaunchConfiguration('use_mock_fcu')
     start_mavros = LaunchConfiguration('start_mavros')
     start_fcu_guard = LaunchConfiguration('start_fcu_guard')
+    start_fcu_state = LaunchConfiguration('start_fcu_state')
+    start_commander = LaunchConfiguration('start_commander')
+    start_uwb_nav = LaunchConfiguration('start_uwb_nav')
+    start_mission = LaunchConfiguration('start_mission')
     delta_target_topic = LaunchConfiguration('delta_target_topic')
 
     return LaunchDescription([
@@ -64,9 +92,17 @@ def generate_launch_description():
         DeclareLaunchArgument('health_params', default_value=health_default),
         DeclareLaunchArgument('failsafe_params', default_value=failsafe_default),
         DeclareLaunchArgument('mavros_params', default_value=mavros_default),
+        DeclareLaunchArgument('fcu_state_params', default_value=fcu_state_default),
+        DeclareLaunchArgument('commander_params', default_value=commander_default),
+        DeclareLaunchArgument('uwb_navigator_params', default_value=uwb_navigator_default),
+        DeclareLaunchArgument('mission_sequencer_params', default_value=mission_sequencer_default),
         DeclareLaunchArgument('use_mock_fcu', default_value='false'),
         DeclareLaunchArgument('start_mavros', default_value='false'),
         DeclareLaunchArgument('start_fcu_guard', default_value='true'),
+        DeclareLaunchArgument('start_fcu_state', default_value='true'),
+        DeclareLaunchArgument('start_commander', default_value='true'),
+        DeclareLaunchArgument('start_uwb_nav', default_value='false'),
+        DeclareLaunchArgument('start_mission', default_value='false'),
         DeclareLaunchArgument('delta_target_topic', default_value='target_point_safe'),
 
         Node(
@@ -129,5 +165,37 @@ def generate_launch_description():
             output='screen',
             parameters=[failsafe_params],
             condition=IfCondition(start_fcu_guard)
+        ),
+        Node(
+            package='uav_bridge',
+            executable='fcu_state_node',
+            name='fcu_state_node',
+            output='screen',
+            parameters=[fcu_state_params],
+            condition=IfCondition(start_fcu_state)
+        ),
+        Node(
+            package='uav_bridge',
+            executable='flight_commander_node',
+            name='flight_commander_node',
+            output='screen',
+            parameters=[commander_params],
+            condition=IfCondition(start_commander)
+        ),
+        Node(
+            package='uav_bridge',
+            executable='uwb_navigator_node',
+            name='uwb_navigator_node',
+            output='screen',
+            parameters=[uwb_navigator_params],
+            condition=IfCondition(start_uwb_nav)
+        ),
+        Node(
+            package='uav_bridge',
+            executable='mission_sequencer_node',
+            name='mission_sequencer_node',
+            output='screen',
+            parameters=[mission_sequencer_params],
+            condition=IfCondition(start_mission)
         ),
     ])
