@@ -14,6 +14,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/GraspTarget.msg"
   "msg/FcuState.msg"
   "msg/UwbStatus.msg"
+  "msg/UwbAoa.msg"
   "srv/SetArmStatus.srv"
   "srv/FlightCommand.srv"
   DEPENDENCIES geometry_msgs std_msgs

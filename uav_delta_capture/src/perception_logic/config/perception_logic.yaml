@@ -1,5 +1,0 @@
-perception_node:
-  ros__parameters:
-    image_topic: /camera/image_raw
-    publish_topic: vision/target_offset
-    camera_frame: camera_optical_frame
