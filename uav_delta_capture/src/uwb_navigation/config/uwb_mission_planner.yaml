@@ -17,6 +17,12 @@ uwb_mission_planner_node:
     # 控制参数
     kp_horizontal: 0.4         # 水平比例增益
     kp_vertical: 0.3           # 垂直比例增益
+    ki_horizontal: 0.0         # 水平积分增益 (0=禁用)
+    ki_vertical: 0.0           # 垂直积分增益 (0=禁用)
+    kd_horizontal: 0.0         # 水平微分增益 (0=禁用, 预留)
+    kd_vertical: 0.0           # 垂直微分增益 (0=禁用, 预留)
+    integral_limit: 1.0        # 积分限幅 (m·s)
+    lp_filter_alpha: 0.3       # 低通滤波系数 (0.01~0.99)
     max_vel_xy: 0.5            # 最大水平速度 (m/s)
     max_vel_z: 0.3             # 最大垂直速度 (m/s)
     max_accel_xy: 0.3          # 最大水平加速度 (m/s²)

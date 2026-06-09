@@ -34,7 +34,8 @@ public:
     circle_period_sec_ = std::max(0.1, circle_period_sec_);
     line_period_sec_ = std::max(0.1, line_period_sec_);
 
-    pub_ = create_publisher<geometry_msgs::msg::PoseStamped>(topic_name_, 20);
+    pub_ = create_publisher<geometry_msgs::msg::PoseStamped>(
+      topic_name_, rclcpp::SensorDataQoS());
 
     const auto timer_period = std::chrono::duration<double>(1.0 / publish_rate_hz_);
     timer_ = create_wall_timer(

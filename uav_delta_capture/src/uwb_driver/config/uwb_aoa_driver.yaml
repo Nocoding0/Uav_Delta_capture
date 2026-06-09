@@ -1,7 +1,7 @@
 uwb_aoa_driver_node:
   ros__parameters:
     # 串口配置
-    serial_port: /dev/ttyACM1
+    serial_port: /dev/ttySTM1
     serial_baud: 115200
 
     # 话题

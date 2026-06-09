@@ -89,6 +89,12 @@ public:
     // 控制参数
     kp_horizontal_(declare_parameter<double>("kp_horizontal", 0.4)),
     kp_vertical_(declare_parameter<double>("kp_vertical", 0.3)),
+    ki_horizontal_(declare_parameter<double>("ki_horizontal", 0.0)),
+    ki_vertical_(declare_parameter<double>("ki_vertical", 0.0)),
+    kd_horizontal_(declare_parameter<double>("kd_horizontal", 0.0)),
+    kd_vertical_(declare_parameter<double>("kd_vertical", 0.0)),
+    integral_limit_(declare_parameter<double>("integral_limit", 1.0)),
+    lp_filter_alpha_(declare_parameter<double>("lp_filter_alpha", 0.3)),
     max_vel_xy_(declare_parameter<double>("max_vel_xy", 0.5)),
     max_vel_z_(declare_parameter<double>("max_vel_z", 0.3)),
     max_accel_xy_(declare_parameter<double>("max_accel_xy", 0.3)),
@@ -108,6 +114,12 @@ public:
     descend_altitude_ = std::max(0.2, descend_altitude_);
     kp_horizontal_ = std::max(0.01, kp_horizontal_);
     kp_vertical_ = std::max(0.01, kp_vertical_);
+    ki_horizontal_ = std::max(0.0, ki_horizontal_);
+    ki_vertical_ = std::max(0.0, ki_vertical_);
+    kd_horizontal_ = std::max(0.0, kd_horizontal_);
+    kd_vertical_ = std::max(0.0, kd_vertical_);
+    integral_limit_ = std::max(0.1, integral_limit_);
+    lp_filter_alpha_ = std::clamp(lp_filter_alpha_, 0.01, 0.99);
     max_vel_xy_ = std::max(0.1, max_vel_xy_);
     max_vel_z_ = std::max(0.1, max_vel_z_);
 
@@ -275,29 +287,66 @@ private:
     }
 
     // 水平控制：利用方位角控制，目标是 azimuth = 0（在正前方）
-    float vx = 0.0f, vy = 0.0f;
-    float az_rad = uwb.azimuth_deg * static_cast<float>(M_PI / 180.0);
+    // PID 控制
+    double dt = 1.0 / control_rate_hz_;
+    double alpha = lp_filter_alpha_;
+
+    float az_rad = uwb.azimuth_deg * M_PI / 180.0;
     float horizontal_dist = uwb.distance_m * std::cos(az_rad);
 
-    // 方位角控制：左右调整
+    // 误差计算
+    double error_x = -az_rad;  // 方位角误差
+    double error_y = -horizontal_dist;  // 距离误差
+
+    // 低通滤波
+    filtered_error_x_ = alpha * error_x + (1.0 - alpha) * filtered_error_x_;
+    filtered_error_y_ = alpha * error_y + (1.0 - alpha) * filtered_error_y_;
+
+    // 积分项（含抗饱和）
+    integral_x_ += error_x * dt;
+    integral_y_ += error_y * dt;
+    integral_x_ = std::clamp(integral_x_, -integral_limit_, integral_limit_);
+    integral_y_ = std::clamp(integral_y_, -integral_limit_, integral_limit_);
+
+    // 微分项
+    double derivative_x = (filtered_error_x_ - prev_error_x_) / dt;
+    double derivative_y = (filtered_error_y_ - prev_error_y_) / dt;
+
+    // 保存误差
+    prev_error_x_ = filtered_error_x_;
+    prev_error_y_ = filtered_error_y_;
+
+    // PID 输出
+    float vx = 0.0f, vy = 0.0f;
     if (std::abs(uwb.azimuth_deg) > azimuth_deadband_) {
-      vx = -kp_horizontal_ * az_rad * max_vel_xy_;
+      vx = -kp_horizontal_ * error_x - ki_horizontal_ * integral_x_ - kd_horizontal_ * derivative_x;
       vx = std::clamp(vx, static_cast<float>(-max_vel_xy_), static_cast<float>(max_vel_xy_));
     }
 
-    // 距离控制：前后调整
     if (horizontal_dist > horizontal_deadband_) {
-      vy = -kp_horizontal_ * horizontal_dist;
+      vy = -kp_horizontal_ * error_y - ki_horizontal_ * integral_y_ - kd_horizontal_ * derivative_y;
       vy = std::clamp(vy, static_cast<float>(-max_vel_xy_), static_cast<float>(max_vel_xy_));
     }
 
-    // 高度保持
+    // 高度保持 - PID 控制
     float vz = 0.0f;
     {
       std::lock_guard<std::mutex> lk(data_mtx_);
       if (has_fcu_) {
-        float alt_error = takeoff_altitude_ - last_fcu_->local_z;
-        vz = kp_vertical_ * alt_error;
+        double error_z = takeoff_altitude_ - last_fcu_->local_z;
+
+        // 低通滤波
+        filtered_error_z_ = alpha * error_z + (1.0 - alpha) * filtered_error_z_;
+
+        // 积分
+        integral_z_ += error_z * dt;
+        integral_z_ = std::clamp(integral_z_, -integral_limit_, integral_limit_);
+
+        // 微分
+        double derivative_z = (filtered_error_z_ - prev_error_z_) / dt;
+        prev_error_z_ = filtered_error_z_;
+
+        vz = kp_vertical_ * error_z + ki_vertical_ * integral_z_ + kd_vertical_ * derivative_z;
         vz = std::clamp(vz, static_cast<float>(-max_vel_z_), static_cast<float>(max_vel_z_));
       }
     }
@@ -344,22 +393,46 @@ private:
       uwb = getLatestUwb();
     }
 
-    // 水平保持：保持在 A 正上方
-    float vx = 0.0f, vy = 0.0f;
-    float az_rad = uwb.azimuth_deg * static_cast<float>(M_PI / 180.0);
+    // 水平保持：保持在 A 正上方 - PID 控制（下降时增益减半）
+    double dt = 1.0 / control_rate_hz_;
+    double alpha = lp_filter_alpha_;
+
+    float az_rad = uwb.azimuth_deg * M_PI / 180.0;
     float horizontal_dist = uwb.distance_m * std::cos(az_rad);
 
+    // 误差计算
+    double error_x = -az_rad;
+    double error_y = -horizontal_dist;
+
+    // 低通滤波
+    filtered_error_x_ = alpha * error_x + (1.0 - alpha) * filtered_error_x_;
+    filtered_error_y_ = alpha * error_y + (1.0 - alpha) * filtered_error_y_;
+
+    // 积分项
+    integral_x_ += error_x * dt;
+    integral_y_ += error_y * dt;
+    integral_x_ = std::clamp(integral_x_, -integral_limit_, integral_limit_);
+    integral_y_ = std::clamp(integral_y_, -integral_limit_, integral_limit_);
+
+    // 微分项
+    double derivative_x = (filtered_error_x_ - prev_error_x_) / dt;
+    double derivative_y = (filtered_error_y_ - prev_error_y_) / dt;
+    prev_error_x_ = filtered_error_x_;
+    prev_error_y_ = filtered_error_y_;
+
+    // PID 输出（下降时水平修正减半）
+    float vx = 0.0f, vy = 0.0f;
     if (std::abs(uwb.azimuth_deg) > azimuth_deadband_) {
-      vx = -kp_horizontal_ * az_rad * max_vel_xy_ * 0.5f;  // 下降时水平修正减半
+      vx = (-kp_horizontal_ * error_x - ki_horizontal_ * integral_x_ - kd_horizontal_ * derivative_x) * 0.5f;
       vx = std::clamp(vx, static_cast<float>(-max_vel_xy_ * 0.5f), static_cast<float>(max_vel_xy_ * 0.5f));
     }
 
     if (horizontal_dist > horizontal_deadband_) {
-      vy = -kp_horizontal_ * horizontal_dist * 0.5f;
+      vy = (-kp_horizontal_ * error_y - ki_horizontal_ * integral_y_ - kd_horizontal_ * derivative_y) * 0.5f;
       vy = std::clamp(vy, static_cast<float>(-max_vel_xy_ * 0.5f), static_cast<float>(max_vel_xy_ * 0.5f));
     }
 
-    // 垂直下降：利用仰角或距离计算目标高度
+    // 垂直下降 - PID 控制
     float vz = 0.0f;
     {
       std::lock_guard<std::mutex> lk(data_mtx_);
@@ -369,14 +442,26 @@ private:
 
         // 如果仰角可用，利用仰角计算更精确的高度
         if (uwb.elevation_deg != 0) {
-          float el_rad = uwb.elevation_deg * static_cast<float>(M_PI / 180.0);
+          float el_rad = uwb.elevation_deg * M_PI / 180.0;
           float height_from_uwb = uwb.distance_m * std::sin(el_rad);
           target_alt = std::max(static_cast<float>(descend_altitude_), height_from_uwb);
         }
 
-        float alt_error = target_alt - current_alt;
-        if (std::abs(alt_error) > altitude_tolerance_) {
-          vz = -kp_vertical_ * std::abs(alt_error);  // 向下为负
+        double error_z = target_alt - current_alt;
+
+        // 低通滤波
+        filtered_error_z_ = alpha * error_z + (1.0 - alpha) * filtered_error_z_;
+
+        // 积分
+        integral_z_ += error_z * dt;
+        integral_z_ = std::clamp(integral_z_, -integral_limit_, integral_limit_);
+
+        // 微分
+        double derivative_z = (filtered_error_z_ - prev_error_z_) / dt;
+        prev_error_z_ = filtered_error_z_;
+
+        if (std::abs(error_z) > altitude_tolerance_) {
+          vz = kp_vertical_ * error_z + ki_vertical_ * integral_z_ + kd_vertical_ * derivative_z;
           vz = std::clamp(vz, static_cast<float>(-max_vel_z_), 0.0f);
         }
       }
@@ -444,6 +529,17 @@ private:
   {
     RCLCPP_INFO(get_logger(), "Phase: %s → %s", phaseToString(phase_), phaseToString(new_phase));
     phase_ = new_phase;
+
+    // 阶段切换时清零 PID 状态
+    integral_x_ = 0.0;
+    integral_y_ = 0.0;
+    integral_z_ = 0.0;
+    prev_error_x_ = 0.0;
+    prev_error_y_ = 0.0;
+    prev_error_z_ = 0.0;
+    filtered_error_x_ = 0.0;
+    filtered_error_y_ = 0.0;
+    filtered_error_z_ = 0.0;
   }
 
   static const char * phaseToString(Phase phase)
@@ -570,6 +666,12 @@ private:
 
   double kp_horizontal_;
   double kp_vertical_;
+  double ki_horizontal_;
+  double ki_vertical_;
+  double kd_horizontal_;
+  double kd_vertical_;
+  double integral_limit_;
+  double lp_filter_alpha_;
   double max_vel_xy_;
   double max_vel_z_;
   double max_accel_xy_;
@@ -584,7 +686,18 @@ private:
   double uwb_signal_timeout_;
   double low_battery_pct_;
 
-  // ── 状态 ─────────────────────────────────────────────────────────
+  // PID 状态
+  double integral_x_{0.0};
+  double integral_y_{0.0};
+  double integral_z_{0.0};
+  double prev_error_x_{0.0};
+  double prev_error_y_{0.0};
+  double prev_error_z_{0.0};
+  double filtered_error_x_{0.0};
+  double filtered_error_y_{0.0};
+  double filtered_error_z_{0.0};
+
+  // 状态 ─────────────────────────────────────────────────────────
 
   Phase phase_{Phase::IDLE};
   std::optional<rclcpp::Time> hover_start_time_;
