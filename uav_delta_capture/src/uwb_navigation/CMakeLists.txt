@@ -33,8 +33,10 @@ install(FILES
   launch/uwb_mission_planner.launch.py
   launch/uwb_navigation_system.launch.py
   launch/test_mission.launch.py
+  launch/test_mission_real.launch.py
   config/uwb_mission_planner.yaml
   config/test_mission.yaml
+  config/test_mission_mock.yaml
   DESTINATION share/${PROJECT_NAME}
 )
 

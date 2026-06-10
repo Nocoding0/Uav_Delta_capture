@@ -10,9 +10,9 @@ test_mission_node:
     mission_event_topic: test_mission/event
     flight_command_service: flight_command
 
-    # 模式
-    use_mock: false
-    fake_grasp: true            # 假抓取信号 (10s 自动完成)
+    # 模式 (mock=true 跳过真实传感器检查, 纯计时器推进)
+    use_mock: true
+    fake_grasp: true
     fake_grasp_delay_sec: 10.0
 
     # 飞行高度 (m)
@@ -38,9 +38,9 @@ test_mission_node:
     altitude_tolerance: 0.15
     return_xy_tolerance: 0.3
 
-    # 时序
-    hover_stable_time: 2.0
-    grasp_duration_sec: 5.0
+    # 时序 — 延长以方便手动测试
+    hover_stable_time: 5.0
+    grasp_duration_sec: 15.0
     control_rate_hz: 20.0
 
     # 安全

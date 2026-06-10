@@ -96,6 +96,8 @@ class TestMissionNode(Node):
 
         # 模式
         self.use_mock = self.declare_parameter("use_mock", False).value
+        self.fake_grasp = self.declare_parameter("fake_grasp", True).value
+        self.fake_grasp_delay_sec = self.declare_parameter("fake_grasp_delay_sec", 10.0).value
 
         # 飞行高度
         self.takeoff_altitude = self.declare_parameter("takeoff_altitude", 1.5).value
@@ -242,11 +244,22 @@ class TestMissionNode(Node):
     def _check_critical(self) -> bool:
         if self.phase in (Phase.FAILSAFE, Phase.DONE, Phase.LAND):
             return False
+
+        # ── 链路丢失检查 (mock / 真实模式均生效) ──
+        link = self._last_link_status
+        if link == "LOST":
+            if self.phase != Phase.RECOVERING:
+                self._publish_event("link_recovering")
+                self._transition(Phase.RECOVERING)
+                return True   # 刚进入 RECOVERING，跳过当前帧正常控制
+            # 已在 RECOVERING 阶段: 不 return True，让 _tick_recovering 运行超时/恢复逻辑
+            return False
+
+        # ── 硬件相关检查 (mock 模式下跳过) ──
         if self.use_mock:
-            return False  # mock 模式不检查安全条件
+            return False
 
         fcu = self._last_fcu_state
-        link = self._last_link_status
 
         if not fcu or not fcu.connected:
             if self.phase not in (Phase.INIT, Phase.ARM):
@@ -255,14 +268,7 @@ class TestMissionNode(Node):
                 return True
             return False
 
-        if link == "LOST":
-            # 进入恢复悬停阶段，而非直接 FAILSAFE
-            if self.phase != Phase.RECOVERING:
-                self._publish_event("link_recovering")
-                self._transition(Phase.RECOVERING)
-            return True  # 返回 True 表示链路异常，调用方应停止正常控制
-
-        if fcu.remaining < self.low_battery_pct / 100.0:
+        if fcu.voltage > 0.1 and fcu.remaining < self.low_battery_pct / 100.0:
             self._publish_event("failsafe_low_battery")
             self._transition(Phase.FAILSAFE)
             return True
@@ -481,20 +487,27 @@ class TestMissionNode(Node):
             self.hover_start_time = None
 
     def _tick_hover_final(self):
-        """近距离悬停 + 假抓取计时器。"""
+        """近距离悬停 + 假抓取 / 真抓取信号。"""
         self._publish_velocity(0.0, 0.0, 0.0)
 
-        now = self.get_clock().now()
-        if self.grasp_start_time is None:
-            self.grasp_start_time = now
-            self.get_logger().info(f"Waiting for grasp (fake, {self.grasp_duration_sec:.1f}s)...")
+        # 假抓取: 计时器到期自动触發 CLIMB
+        if self.fake_grasp:
+            now = self.get_clock().now()
+            if self.grasp_start_time is None:
+                self.grasp_start_time = now
+                self.get_logger().info(
+                    f"Waiting for fake grasp ({self.fake_grasp_delay_sec:.1f}s)..."
+                )
+            elapsed = (now - self.grasp_start_time).nanoseconds / 1e9
+            if elapsed >= self.fake_grasp_delay_sec:
+                self.get_logger().info("Fake grasp complete, climbing")
+                self._publish_event("grasp_complete")
+                self.grasp_start_time = None
+                self._transition(Phase.CLIMB)
+            return
 
-        elapsed = (now - self.grasp_start_time).nanoseconds / 1e9
-        if elapsed >= self.grasp_duration_sec:
-            self.get_logger().info("Grasp complete (fake signal), climbing")
-            self._publish_event("grasp_complete")
-            self.grasp_start_time = None
-            self._transition(Phase.CLIMB)
+        # TODO: 真抓取 — 订阅抓取完成信号，收到后切换 CLIMB
+        self.get_logger().debug("Waiting for real grasp signal...")
 
     def _tick_climb(self):
         """爬升回巡航高度 (mock 模式: 纯计时器)。"""
