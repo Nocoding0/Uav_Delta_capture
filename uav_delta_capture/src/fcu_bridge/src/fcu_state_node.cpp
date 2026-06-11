@@ -171,8 +171,10 @@ private:
       msg.vel_horiz_status = last_ekf_->velocity_horiz_status_flag;
       msg.vel_vert_status = last_ekf_->velocity_vert_status_flag;
       msg.pos_horiz_status = last_ekf_->pos_horiz_abs_status_flag;
+      // pos_horiz_abs 需要 GPS/外部绝对定位, 室内光流/UWB 方案永远为 false,
+      // 不纳入 estimator_ok 判定, 否则室内无法解锁
       msg.estimator_ok = msg.attitude_status && msg.vel_horiz_status &&
-                         msg.vel_vert_status && msg.pos_horiz_status;
+                         msg.vel_vert_status;
     } else {
       msg.attitude_status = false;
       msg.vel_horiz_status = false;

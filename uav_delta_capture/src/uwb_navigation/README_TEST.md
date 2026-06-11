@@ -144,3 +144,12 @@ docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic 
 # 看状态
 docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /uav_bridge/flight_state --once"
 ```
+
+
+
+
+
+启动docker：
+  nohup dockerd > /tmp/dockerd.log 2>&1 & sleep 5
+  docker start ros2humble
+  

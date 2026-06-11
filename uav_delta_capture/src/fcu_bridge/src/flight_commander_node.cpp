@@ -33,7 +33,8 @@ public:
     vel_forward_rate_hz_(declare_parameter<double>("vel_forward_rate_hz", 20.0)),
     use_mock_(declare_parameter<bool>("use_mock", false)),
     max_vel_xy_(declare_parameter<double>("max_vel_xy", 1.0)),
-    max_vel_z_(declare_parameter<double>("max_vel_z", 0.5))
+    max_vel_z_(declare_parameter<double>("max_vel_z", 0.5)),
+    skip_ekf_check_(declare_parameter<bool>("skip_ekf_check", false))
   {
     vel_forward_rate_hz_ = std::max(1.0, vel_forward_rate_hz_);
     max_vel_xy_ = std::max(0.1, max_vel_xy_);
@@ -84,8 +85,9 @@ public:
 
     RCLCPP_INFO(
       get_logger(),
-      "flight_commander_node started: service=%s mock=%s max_vel_xy=%.1f max_vel_z=%.1f",
-      service_topic_.c_str(), use_mock_ ? "true" : "false", max_vel_xy_, max_vel_z_);
+      "flight_commander_node started: service=%s mock=%s max_vel_xy=%.1f max_vel_z=%.1f skip_ekf=%s",
+      service_topic_.c_str(), use_mock_ ? "true" : "false", max_vel_xy_, max_vel_z_,
+      skip_ekf_check_ ? "true" : "false");
   }
 
 private:
@@ -140,7 +142,7 @@ private:
       return;
     }
 
-    if (arm && !last_state_->estimator_ok) {
+    if (arm && !skip_ekf_check_ && !last_state_->estimator_ok) {
       response->success = false;
       response->message = "EKF not ready, cannot arm";
       RCLCPP_WARN(get_logger(), "Arm rejected: EKF not ok");
@@ -166,9 +168,18 @@ private:
         rclcpp::Client<mavros_msgs::srv::CommandBool>::SharedFuture future)
       {
         auto result = future.get();
-        response->success = result->success;
-        response->message = result->result ? (arm ? "armed" : "disarmed") : "arm/disarm command rejected by FCU";
-        RCLCPP_INFO(get_logger(), "Arm(%s) result: %s", arm ? "true" : "false", response->message.c_str());
+        // ArduPilot 偶有 result->success=false 但命令实际被接受的情况 (电机已解锁)。
+        // 旧代码 message 用 result->result 判定显示了 "armed", 说明 result 字段可信;
+        // 但 success 字段单独用却是 false, 二者矛盾。诊断日志打印原始值以确认语义,
+        // 判定采用 success || result 任一为真 (即飞控以任一方式表示接受)。
+        const bool accepted = result->success || (result->result != 0);
+        response->success = accepted;
+        response->message = accepted ? (arm ? "armed" : "disarmed") : "arm/disarm command rejected by FCU";
+        RCLCPP_INFO(get_logger(), "Arm(%s) raw: success=%d result=%u -> %s",
+                    arm ? "true" : "false",
+                    static_cast<int>(result->success),
+                    static_cast<unsigned>(result->result),
+                    response->message.c_str());
         {
           std::lock_guard<std::mutex> lk(mtx);
           done = true;
@@ -341,6 +352,7 @@ private:
   bool use_mock_;
   double max_vel_xy_;
   double max_vel_z_;
+  bool skip_ekf_check_;
 
   // Callback group (reentrant to allow nested async service calls)
   rclcpp::CallbackGroup::SharedPtr cb_group_;
