@@ -1,84 +1,23 @@
-# fcu_bridge - 飞控通信桥接包
+# fcu_bridge
 
-MAVROS 飞控通信桥接与状态发布。
+Bridge package between project nodes and MAVROS.
 
-## 功能
+## Nodes
 
-- MAVROS 连接状态监控
-- 飞行模式与解锁状态发布
-- 姿态角提取与发布
-- 飞行指令发送
-- MAVROS 连接健康检查
+- `fcu_state_node`: publishes `fcu_state` from MAVROS state, battery, estimator, and local pose.
+- `flight_commander_node`: exposes `flight_command` and forwards project `cmd_vel` setpoints to MAVROS.
+- `fcu_link_monitor_node`: monitors `/mavros/local_position/pose` freshness and publishes `fcu_link/status`.
+- `mock_mavros_pose_node`: publishes synthetic local pose for mock tests.
 
-## 节点
+## Velocity Safety
 
-### fcu_state_node
+`flight_commander_node` clamps velocity setpoints and publishes a zero setpoint if the latest project `cmd_vel` is older than `vel_timeout_sec`.
 
-飞控状态发布节点。
+Default topics:
 
-**订阅：**
-- `mavros/state`（`mavros_msgs/State`）
-- `mavros/local_position/pose`（`geometry_msgs/PoseStamped`）
+- input: `cmd_vel`
+- output: `/mavros/setpoint_velocity/cmd_vel`
 
-**发布：**
-- `fcu/state`（`mavros_msgs/State`）- 飞控状态
-- `fcu/armed`（`std_msgs/Bool`）- 解锁状态
-- `fcu/flight_mode`（`std_msgs/String`）- 飞行模式
+## Manual Takeover
 
-### attitude_publisher_node
-
-姿态角发布节点。
-
-**订阅：**
-- `mavros/local_position/pose`（`geometry_msgs/PoseStamped`）
-- `mavros/imu/data`（`sensor_msgs/Imu`）
-
-**发布：**
-- `fcu/local_attitude`（`geometry_msgs/Vector3Stamped`）- roll/pitch/yaw
-- `fcu/imu_attitude`（`geometry_msgs/Vector3Stamped`）- IMU 姿态
-
-**参数：**
-- `pose_topic`（string）- 位姿话题，默认 `mavros/local_position/pose`
-- `imu_topic`（string）- IMU 话题，默认 `mavros/imu/data`
-- `local_attitude_topic`（string）- 发布话题，默认 `fcu/local_attitude`
-- `imu_attitude_topic`（string）- IMU 话题，默认 `fcu/imu_attitude`
-
-### flight_commander_node
-
-飞行指令发送节点。
-
-**服务：**
-- `fcu/arm`（`std_srvs/Trigger`）- 解锁
-- `fcu/takeoff`（`std_srvs/Trigger`）- 起飞
-- `fcu/land`（`std_srvs/Trigger`）- 降落
-- `fcu/set_mode`（`mavros_msgs/SetMode`）- 设置模式
-
-### fcu_link_monitor_node
-
-MAVROS 连接监控节点。
-
-**发布：**
-- `fcu/link_status`（`std_msgs/Bool`）- 连接状态
-- `fcu/heartbeat`（`std_msgs/Header`）- 心跳
-
-### mock_mavros_pose_node
-
-模拟 MAVROS 位姿（测试用）。
-
-**发布：**
-- `mavros/local_position/pose`（`geometry_msgs/PoseStamped`）
-- `mavros/imu/data`（`sensor_msgs/Imu`）
-
-## 使用
-
-```bash
-# 启动姿态发布
-ros2 launch fcu_bridge attitude_publisher.launch.py
-
-# 测试模式（无需飞控）
-ros2 run fcu_bridge mock_mavros_pose_node
-```
-
-## 配置
-
-配置文件：`config/attitude_publisher.yaml`
+Manual intervention is expected to happen at the FCU mode/RC layer. Mission code should stop publishing motion commands when FCU mode leaves the configured autonomous mode list.

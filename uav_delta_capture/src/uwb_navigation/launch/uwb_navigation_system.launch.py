@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+"""Full UWB mission system entry.
+
+MAVROS is still expected to be started separately with the FCU URL.
+"""
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -7,46 +12,19 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     return LaunchDescription([
-        # 启动 UWB AOA 驱动
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                PathJoinSubstitution([
-                    FindPackageShare('uwb_driver'),
-                    'launch',
-                    'uwb_aoa_driver.launch.py'
-                ])
-            )
-        ),
-
-        # 启动姿态发布
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                PathJoinSubstitution([
-                    FindPackageShare('fcu_bridge'),
-                    'launch',
-                    'attitude_publisher.launch.py'
-                ])
-            )
-        ),
-
-        # 启动视觉变换
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                PathJoinSubstitution([
-                    FindPackageShare('vision_bridge'),
-                    'launch',
-                    'vision_transform.launch.py'
-                ])
-            )
-        ),
-
-        # 启动 UWB 任务规划
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 PathJoinSubstitution([
                     FindPackageShare('uwb_navigation'),
-                    'launch',
-                    'uwb_mission_planner.launch.py'
+                    'test_mission_real_full.launch.py',
+                ])
+            )
+        ),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                PathJoinSubstitution([
+                    FindPackageShare('vision_bridge'),
+                    'vision_transform.launch.py',
                 ])
             )
         ),

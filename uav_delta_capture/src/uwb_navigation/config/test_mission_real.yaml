@@ -10,16 +10,16 @@ test_mission_node:
     mission_event_topic: test_mission/event
     flight_command_service: flight_command
 
-    # Mode: pure software full-flow test.
-    mission_mode: mock_full
-    use_mock: true
+    # Mode: real full mission with fake grasp/drop placeholders.
+    mission_mode: real_full
+    use_mock: false
     desktop_test: false
     arm_mode: ALT_HOLD
 
     fake_grasp: true
-    fake_grasp_delay_sec: 3.0
+    fake_grasp_delay_sec: 10.0
     fake_drop: true
-    fake_drop_delay_sec: 1.0
+    fake_drop_delay_sec: 2.0
     grasp_done_topic: grasp_done
     drop_done_topic: drop_done
 
@@ -40,8 +40,8 @@ test_mission_node:
     hover_stable_time: 2.0
     control_rate_hz: 20.0
 
-    require_uwb_ready: false
-    require_local_pose_ready: false
+    require_uwb_ready: true
+    require_local_pose_ready: true
     uwb_signal_timeout: 3.0
     local_pose_timeout: 1.0
     low_battery_pct: 20.0

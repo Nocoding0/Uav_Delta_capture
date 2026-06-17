@@ -1,66 +1,62 @@
-# uwb_navigation - UWB 导航控制包
+# uwb_navigation
 
-基于 UWB AOA 数据的无人机自主导航控制。
+UWB navigation and mission sequencing for the UAV capture flow.
 
-## 功能
+## Modes
 
-- UWB 数据驱动的 3D 坐标计算
-- 起飞、悬停、水平移动、降落状态机
-- PID 速度控制
-- 超时与故障保护
+- `mock_full`: pure software flow test.
+- `bench_velocity`: real FCU/UWB/local-pose preflight, ARM, short vertical velocity profile, DISARM.
+- `real_full`: real mission flow with fake or topic-driven grasp/drop completion.
 
-## 节点
-
-### uwb_mission_planner_node
-
-导航任务规划主节点。
-
-**订阅话题：**
-- `uwb_aoa/data`（`UavDeltaMsgs/UwbAoa`）- UWB 数据
-- `mavros/state`（`mavros_msgs/State`）- 飞控状态
-- `mavros/local_position/pose`（`geometry_msgs/PoseStamped`）- 当前位置
-
-**发布话题：**
-- `mavros/setpoint_velocity/cmd_vel_unstamped`（`geometry_msgs/Twist`）- 速度指令
-- `uwb_mission/state`（`std_msgs/String`）- 当前状态
-- `uwb_mission/event`（`std_msgs/String`）- 事件通知
-
-**状态机：**
-```
-IDLE → ARMING → TAKEOFF → HOVER_TAKEOFF → MOVE_ABOVE → HOVER_ABOVE → DESCEND → HOVER_FINAL → DONE
-                                                                                    ↓
-                                                                              FAILSAFE
-```
-
-**参数：**
-- `takeoff_altitude`（double）- 起飞高度，默认 `1.5` m
-- `descend_altitude`（double）- 降落高度，默认 `0.5` m
-- `kp_horizontal`（double）- 水平 PID 系数，默认 `0.4`
-- `kp_vertical`（double）- 垂直 PID 系数，默认 `0.3`
-- `max_vel_xy`（double）- 最大水平速度，默认 `0.5` m/s
-- `max_vel_z`（double）- 最大垂直速度，默认 `0.3` m/s
-- `horizontal_deadband`（double）- 水平死区，默认 `0.15` m
-- `hover_stable_time`（double）- 悬停稳定时间，默认 `2.0` s
-
-## 使用
+## Launch
 
 ```bash
-# 单独启动
-ros2 launch uwb_navigation uwb_mission_planner.launch.py
+# Pure mock full flow
+ros2 launch uwb_navigation test_mission.launch.py
 
-# 启动完整导航系统
-ros2 launch uwb_navigation uwb_navigation_system.launch.py
+# Bench test. Start MAVROS first. No propellers.
+ros2 launch uwb_navigation test_mission_bench.launch.py
+
+# Backward-compatible bench entry
+ros2 launch uwb_navigation test_mission_real.launch.py
+
+# Real full mission. Start MAVROS first.
+ros2 launch uwb_navigation test_mission_real_full.launch.py
 ```
 
-## 配置
+## Mission Flow
 
-配置文件：`config/uwb_mission_planner.yaml`
+```text
+INIT -> ARM -> TAKEOFF -> HOVER_TAKEOFF -> MOVE_ABOVE -> HOVER_ABOVE
+-> DESCEND -> HOVER_FINAL -> WAIT_GRASP -> CLIMB -> HOVER_CLIMB
+-> RETURN -> HOVER_RETURN -> WAIT_DROP -> LAND -> DONE
+```
 
-## 飞行路径
+`BENCH_VELOCITY` is used only by `bench_velocity`.
 
-1. **起飞** - 解锁并爬升到 `takeoff_altitude`
-2. **悬停** - 在起飞点悬停 `hover_stable_time` 秒
-3. **水平移动** - 飞到目标正上方
-4. **悬停** - 在目标上方悬停稳定
-5. **降落** - 下降到 `descend_altitude`
-6. **最终悬停** - 稳定后交给机械臂
+## Navigation Policy
+
+- UWB guides the aircraft from takeoff hover to above the tag.
+- Return uses `/mavros/local_position/pose` and the recorded takeoff origin.
+- The node does not run SLAM and does not read UTF01 directly. UTF01/optical flow must be fused by the FCU/MAVROS local position estimate.
+- RC intervention is handled by mode takeover: if FCU mode leaves `auto_modes`, the mission publishes zero velocity and enters `PAUSED_MANUAL`.
+
+## Placeholder Interfaces
+
+- `grasp_done` (`std_msgs/String`): values `true`, `ok`, `done`, `complete`, `success`, or `1` complete grasp.
+- `drop_done` (`std_msgs/String`): same convention for drop completion.
+- `fake_grasp` / `fake_drop` can keep these stages timer-driven until the real modules are ready.
+
+## Key Parameters
+
+- `mission_mode`
+- `use_mock`
+- `desktop_test`
+- `require_uwb_ready`
+- `require_local_pose_ready`
+- `takeoff_altitude`
+- `descend_altitude`
+- `max_vel_xy`
+- `max_vel_z`
+- `velocity_slew_rate`
+- `auto_modes`

@@ -23,7 +23,10 @@ def generate_launch_description():
         ),
         Node(
             package='fcu_bridge', executable='flight_commander_node', name='flight_commander_node',
-            parameters=[{'use_mock': True}],
+            parameters=[{'use_mock': True, 'vel_timeout_sec': 0.5}],
+        ),
+        Node(
+            package='fcu_bridge', executable='fcu_link_monitor_node', name='fcu_link_monitor_node',
         ),
         Node(
             package='fcu_bridge', executable='flight_state_machine_node', name='flight_state_machine_node',

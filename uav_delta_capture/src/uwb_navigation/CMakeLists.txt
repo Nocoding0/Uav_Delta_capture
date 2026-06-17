@@ -11,7 +11,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(uav_delta_msgs REQUIRED)
 
-# uwb_mission_planner_node (C++)
+# uwb_mission_planner_node
 add_executable(uwb_mission_planner_node src/uwb_mission_planner_node.cpp)
 ament_target_dependencies(uwb_mission_planner_node
   rclcpp geometry_msgs std_msgs uav_delta_msgs
@@ -22,21 +22,12 @@ install(TARGETS
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
-# test_mission_node (Python)
 install(PROGRAMS
   src/test_mission_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
-# Launch and config files
-install(FILES
-  launch/uwb_mission_planner.launch.py
-  launch/uwb_navigation_system.launch.py
-  launch/test_mission.launch.py
-  launch/test_mission_real.launch.py
-  config/uwb_mission_planner.yaml
-  config/test_mission.yaml
-  config/test_mission_mock.yaml
+install(DIRECTORY launch/ config/
   DESTINATION share/${PROJECT_NAME}
 )
 

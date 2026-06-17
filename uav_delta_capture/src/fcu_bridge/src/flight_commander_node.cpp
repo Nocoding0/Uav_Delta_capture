@@ -31,14 +31,17 @@ public:
     mavros_vel_topic_(declare_parameter<std::string>("mavros_vel_topic", "/mavros/setpoint_velocity/cmd_vel")),
     mavros_takeoff_topic_(declare_parameter<std::string>("mavros_takeoff_topic", "/mavros/cmd/takeoff")),
     vel_forward_rate_hz_(declare_parameter<double>("vel_forward_rate_hz", 20.0)),
+    vel_timeout_sec_(declare_parameter<double>("vel_timeout_sec", 0.5)),
     use_mock_(declare_parameter<bool>("use_mock", false)),
     max_vel_xy_(declare_parameter<double>("max_vel_xy", 1.0)),
     max_vel_z_(declare_parameter<double>("max_vel_z", 0.5)),
     skip_ekf_check_(declare_parameter<bool>("skip_ekf_check", false))
   {
     vel_forward_rate_hz_ = std::max(1.0, vel_forward_rate_hz_);
+    vel_timeout_sec_ = std::max(0.05, vel_timeout_sec_);
     max_vel_xy_ = std::max(0.1, max_vel_xy_);
     max_vel_z_ = std::max(0.1, max_vel_z_);
+    last_vel_time_ = now();
 
     // Use a reentrant callback group so async service calls from within
     // the service callback don't deadlock with the executor.
@@ -64,6 +67,7 @@ public:
       [this](const geometry_msgs::msg::TwistStamped::SharedPtr msg) {
         last_vel_ = msg;
         has_vel_ = true;
+        last_vel_time_ = now();
       });
 
     // Velocity publisher (to MAVROS)
@@ -85,9 +89,9 @@ public:
 
     RCLCPP_INFO(
       get_logger(),
-      "flight_commander_node started: service=%s mock=%s max_vel_xy=%.1f max_vel_z=%.1f skip_ekf=%s",
+      "flight_commander_node started: service=%s mock=%s max_vel_xy=%.1f max_vel_z=%.1f vel_timeout=%.2fs skip_ekf=%s",
       service_topic_.c_str(), use_mock_ ? "true" : "false", max_vel_xy_, max_vel_z_,
-      skip_ekf_check_ ? "true" : "false");
+      vel_timeout_sec_, skip_ekf_check_ ? "true" : "false");
   }
 
 private:
@@ -168,13 +172,13 @@ private:
         rclcpp::Client<mavros_msgs::srv::CommandBool>::SharedFuture future)
       {
         auto result = future.get();
-        // ArduPilot 偶有 result->success=false 但命令实际被接受的情况 (电机已解锁)。
-        // 旧代码 message 用 result->result 判定显示了 "armed", 说明 result 字段可信;
-        // 但 success 字段单独用却是 false, 二者矛盾。诊断日志打印原始值以确认语义,
-        // 判定采用 success || result 任一为真 (即飞控以任一方式表示接受)。
-        const bool accepted = result->success || (result->result != 0);
+        // 判定以飞控的 MAV_RESULT 为准: result->result == 0 (MAV_RESULT_ACCEPTED) 才算成功。
+        // 实测样本: 成功 success=True/result=0; 失败 success=False/result=4(FAILED)。
+        // 不能用 result->result != 0 判成功 (那会把 FAILED=4 误判为接受)。
+        const bool accepted = (result->result == 0);
         response->success = accepted;
-        response->message = accepted ? (arm ? "armed" : "disarmed") : "arm/disarm command rejected by FCU";
+        response->message = accepted ? (arm ? "armed" : "disarmed")
+                                     : "arm/disarm rejected by FCU (result=" + std::to_string(result->result) + ")";
         RCLCPP_INFO(get_logger(), "Arm(%s) raw: success=%d result=%u -> %s",
                     arm ? "true" : "false",
                     static_cast<int>(result->success),
@@ -327,10 +331,22 @@ private:
     auto clamped = std::make_shared<geometry_msgs::msg::TwistStamped>();
     clamped->header.stamp = now();
     clamped->header.frame_id = last_vel_->header.frame_id.empty() ? "body" : last_vel_->header.frame_id;
-    clamped->twist.linear.x = clamp(last_vel_->twist.linear.x, -max_vel_xy_, max_vel_xy_);
-    clamped->twist.linear.y = clamp(last_vel_->twist.linear.y, -max_vel_xy_, max_vel_xy_);
-    clamped->twist.linear.z = clamp(last_vel_->twist.linear.z, -max_vel_z_, max_vel_z_);
-    clamped->twist.angular.z = last_vel_->twist.angular.z;
+
+    const double age = (now() - last_vel_time_).seconds();
+    if (age > vel_timeout_sec_) {
+      clamped->twist.linear.x = 0.0;
+      clamped->twist.linear.y = 0.0;
+      clamped->twist.linear.z = 0.0;
+      clamped->twist.angular.z = 0.0;
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "Velocity command stale (age=%.2fs), publishing zero setpoint", age);
+    } else {
+      clamped->twist.linear.x = clamp(last_vel_->twist.linear.x, -max_vel_xy_, max_vel_xy_);
+      clamped->twist.linear.y = clamp(last_vel_->twist.linear.y, -max_vel_xy_, max_vel_xy_);
+      clamped->twist.linear.z = clamp(last_vel_->twist.linear.z, -max_vel_z_, max_vel_z_);
+      clamped->twist.angular.z = last_vel_->twist.angular.z;
+    }
 
     vel_pub_->publish(*clamped);
   }
@@ -349,6 +365,7 @@ private:
   std::string mavros_vel_topic_;
   std::string mavros_takeoff_topic_;
   double vel_forward_rate_hz_;
+  double vel_timeout_sec_;
   bool use_mock_;
   double max_vel_xy_;
   double max_vel_z_;
@@ -380,6 +397,7 @@ private:
   geometry_msgs::msg::TwistStamped::SharedPtr last_vel_;
   bool has_state_{false};
   bool has_vel_{false};
+  rclcpp::Time last_vel_time_{0, 0, RCL_ROS_TIME};
   float takeoff_altitude_{0.0f};
 };
 
