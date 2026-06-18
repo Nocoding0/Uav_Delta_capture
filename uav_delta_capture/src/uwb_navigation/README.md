@@ -1,62 +1,434 @@
-# uwb_navigation
+# uwb_navigation 包说明
 
-UWB navigation and mission sequencing for the UAV capture flow.
+`uwb_navigation` 是当前 UWB 无人机抓取项目的主任务包，负责状态机编排、UWB 引导、返航控制、mock 测试、桌面 bench 测试和完整任务入口。
 
-## Modes
+当前推荐使用 Python 节点 `test_mission_node.py` 作为主线。C++ 节点 `uwb_mission_planner_node.cpp` 保留为早期规划器/备用实现，不作为当前调试主入口。
 
-- `mock_full`: pure software flow test.
-- `bench_velocity`: real FCU/UWB/local-pose preflight, ARM, short vertical velocity profile, DISARM.
-- `real_full`: real mission flow with fake or topic-driven grasp/drop completion.
+## 运行环境
 
-## Launch
+板子上的 ROS 2 环境运行在 Docker 容器 `ros2humble` 中。下面命令默认在板子系统 shell 中执行；如果已经进入容器，则只执行容器内的 `source` 和 `ros2 ...` 命令即可。
 
 ```bash
-# Pure mock full flow
-ros2 launch uwb_navigation test_mission.launch.py
+# 启动 Docker 服务和 ROS 2 容器
+systemctl start docker
+docker start ros2humble
 
-# Bench test. Start MAVROS first. No propellers.
-ros2 launch uwb_navigation test_mission_bench.launch.py
+# 进入容器
+docker exec -it ros2humble bash
 
-# Backward-compatible bench entry
-ros2 launch uwb_navigation test_mission_real.launch.py
-
-# Real full mission. Start MAVROS first.
-ros2 launch uwb_navigation test_mission_real_full.launch.py
+# 容器内加载 ROS 2 和项目环境
+source /opt/ros/humble/setup.bash
+source /workspace/uav_delta_capture/install/setup.bash
 ```
 
-## Mission Flow
+如果修改了 launch、config 或源码，需要在容器内重新编译相关包：
+
+```bash
+source /opt/ros/humble/setup.bash
+cd /workspace/uav_delta_capture
+colcon build --packages-select fcu_bridge uwb_driver uwb_navigation --parallel-workers 2
+source /workspace/uav_delta_capture/install/setup.bash
+```
+
+## 三种任务模式
+
+| 模式 | Launch 文件 | 配置文件 | 是否需要真实硬件 | 用途 |
+|---|---|---|---|---|
+| `mock_full` | `test_mission.launch.py` | `test_mission_mock.yaml` | 否 | 全软件状态机和 ROS 链路测试 |
+| `bench_velocity` | `test_mission_bench.launch.py` | `test_mission_bench.yaml` | FCU 必需，UWB/测距/光流/本地位置仅监测 | 不上桨叶，ARM 后发送 Z 轴速度曲线再 DISARM |
+| `real_full` | `test_mission_real_full.launch.py` | `test_mission_real.yaml` | 完整硬件 | 完整起飞、UWB 接近、下降、抓取占位、返航、投放占位、降落 |
+
+`test_mission_real.launch.py` 目前是兼容旧命名的 bench 入口，实际等价于 `test_mission_bench.launch.py`。
+
+`uwb_navigation_system.launch.py` 会启动 `real_full` 任务并包含视觉坐标转换 launch，适合后续系统集成。
+
+## 状态机流程
 
 ```text
-INIT -> ARM -> TAKEOFF -> HOVER_TAKEOFF -> MOVE_ABOVE -> HOVER_ABOVE
--> DESCEND -> HOVER_FINAL -> WAIT_GRASP -> CLIMB -> HOVER_CLIMB
--> RETURN -> HOVER_RETURN -> WAIT_DROP -> LAND -> DONE
+INIT
+-> ARM
+-> TAKEOFF
+-> HOVER_TAKEOFF
+-> MOVE_ABOVE
+-> HOVER_ABOVE
+-> DESCEND
+-> HOVER_FINAL
+-> WAIT_GRASP
+-> CLIMB
+-> HOVER_CLIMB
+-> RETURN
+-> HOVER_RETURN
+-> WAIT_DROP
+-> LAND
+-> DONE
 ```
 
-`BENCH_VELOCITY` is used only by `bench_velocity`.
+`bench_velocity` 模式只使用 `INIT -> ARM -> BENCH_VELOCITY -> DONE`。其中 `BENCH_VELOCITY` 会按“上升速度、零速度保持、下降速度、零速度保持”的顺序发送速度 setpoint，验证导航节点到飞控的速度链路，并在结束时输出 `BENCH RESULT` 总结。
 
-## Navigation Policy
+异常状态：
 
-- UWB guides the aircraft from takeoff hover to above the tag.
-- Return uses `/mavros/local_position/pose` and the recorded takeoff origin.
-- The node does not run SLAM and does not read UTF01 directly. UTF01/optical flow must be fused by the FCU/MAVROS local position estimate.
-- RC intervention is handled by mode takeover: if FCU mode leaves `auto_modes`, the mission publishes zero velocity and enters `PAUSED_MANUAL`.
+- `PAUSED_MANUAL`：飞控模式离开 `auto_modes` 后进入，表示遥控器或地面站人工接管。
+- `RECOVERING`：`fcu_link/status` 变为 `LOST` 后进入，链路恢复为 `OK` 后回到悬停阶段。
+- `FAILSAFE`：飞控断连、低电量、恢复超时等严重异常时进入，节点会持续发零速度并尝试降落。
 
-## Placeholder Interfaces
+## 导航策略
 
-- `grasp_done` (`std_msgs/String`): values `true`, `ok`, `done`, `complete`, `success`, or `1` complete grasp.
-- `drop_done` (`std_msgs/String`): same convention for drop completion.
-- `fake_grasp` / `fake_drop` can keep these stages timer-driven until the real modules are ready.
+起飞后，无人机先在 `takeoff_altitude` 高度悬停。`MOVE_ABOVE` 阶段使用 `/uwb_aoa/data` 的距离和方位角信息生成水平速度，让无人机移动到 tag 上方。到达目标上方后进入悬停，再缓慢下降到 `descend_altitude`。
 
-## Key Parameters
+抓取完成后，节点复飞到 `takeoff_altitude`。返航阶段不使用 UWB，而是使用 `/mavros/local_position/pose` 和 `INIT/TAKEOFF` 阶段记录的本地原点。到达原点附近后等待投放完成信号，再执行降落。
 
-- `mission_mode`
-- `use_mock`
-- `desktop_test`
-- `require_uwb_ready`
-- `require_local_pose_ready`
-- `takeoff_altitude`
-- `descend_altitude`
-- `max_vel_xy`
-- `max_vel_z`
-- `velocity_slew_rate`
-- `auto_modes`
+该节点不做 SLAM，不直接读取 UTF01。光流/测距数据应由飞控融合后通过 MAVROS 的本地位置话题输出。
+
+## 话题和服务
+
+### 订阅
+
+| 名称 | 类型 | 作用 |
+|---|---|---|
+| `uwb_aoa/data` | `uav_delta_msgs/msg/UwbAoa` | UWB 距离、方位角、俯仰角和信号有效性 |
+| `fcu_state` | `uav_delta_msgs/msg/FcuState` | 飞控连接、解锁、模式、电池、本地高度等状态 |
+| `/mavros/local_position/pose` | `geometry_msgs/msg/PoseStamped` | 飞控融合后的本地位置，用于起点记录和返航 |
+| `fcu_link/status` | `std_msgs/msg/String` | 飞控本地位置链路状态，常用值为 `OK`/`LOST` |
+| `grasp_done` | `std_msgs/msg/String` | 抓取完成信号 |
+| `drop_done` | `std_msgs/msg/String` | 投放完成信号 |
+
+### 发布
+
+| 名称 | 类型 | 作用 |
+|---|---|---|
+| `cmd_vel` | `geometry_msgs/msg/TwistStamped` | 给 `flight_commander_node` 的速度指令 |
+| `test_mission/state` | `std_msgs/msg/String` | 当前任务状态 |
+| `test_mission/event` | `std_msgs/msg/String` | 关键任务事件 |
+| `uav_bridge/flight_reset` | `std_msgs/msg/String` | 降落完成后重置桥接状态 |
+
+### 服务
+
+| 名称 | 类型 | 作用 |
+|---|---|---|
+| `flight_command` | `uav_delta_msgs/srv/FlightCommand` | ARM、DISARM、TAKEOFF、LAND 等飞控命令 |
+| `/mavros/set_mode` | `mavros_msgs/srv/SetMode` | ARM 前必要时切换飞控模式 |
+
+`grasp_done` 和 `drop_done` 接受这些完成值：`true`、`ok`、`done`、`complete`、`success`、`1`，大小写不敏感。当前配置默认 `fake_grasp: true`、`fake_drop: true`，可以先用计时器占位。
+
+## Mock 全流程测试
+
+用途：不接 FCU、不接 UWB，只验证 ROS 节点、状态机和恢复逻辑。
+
+启动：
+
+```bash
+docker exec -it ros2humble bash -c "
+  source /opt/ros/humble/setup.bash
+  source /workspace/uav_delta_capture/install/setup.bash
+  ros2 launch uwb_navigation test_mission.launch.py
+"
+```
+
+这个 launch 会同时启动：
+
+- `mock_mavros_pose_node`
+- `fcu_state_node`
+- `flight_commander_node`
+- `fcu_link_monitor_node`
+- `flight_state_machine_node`
+- `test_mission_node.py`
+
+另开一个终端查看状态：
+
+```bash
+# 查看任务状态
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /test_mission/state --once"
+
+# 查看任务事件
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /test_mission/event --once"
+
+# 查看飞行状态机
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /uav_bridge/flight_state --once"
+
+# 查看速度指令
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /cmd_vel --once"
+```
+
+手动触发链路恢复流程：
+
+```bash
+# 发送 LOST，触发 RECOVERING
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic pub --once /fcu_link/status std_msgs/msg/String '{data: LOST}'"
+
+# 发送 OK，恢复任务
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic pub --once /fcu_link/status std_msgs/msg/String '{data: OK}'"
+```
+
+建议测试流程：启动 launch，等状态进入 `HOVER_ABOVE` 或 `HOVER_FINAL`，发送 `LOST`，确认进入 `RECOVERING`，再发送 `OK`，确认任务恢复。
+
+## 桌面 bench_velocity 测试
+
+用途：不上桨叶，验证真实 FCU、MAVROS、ARM、速度 setpoint、DISARM 链路，同时观察 UWB、测距、光流和本地位置是否在线。该模式不会让无人机真实起飞，只会在 ARM 后发送 Z 轴速度曲线。
+
+注意：bench 模式不会因为 UWB、测距、光流或 `/mavros/local_position/pose` 暂时没有数据而卡住。节点会在日志中打印 `Bench preflight`，把 FCU、RC、UWB、rangefinder、optical_flow、local_pose、set_mode 服务分别标成 `OK` 或 `WAIT`。其中 FCU 连接、ARM、速度曲线和 DISARM 是核心判据；传感器项是桌面联通性观察项。完整飞行 `real_full` 仍然要求本地位置可用。
+
+默认速度曲线：
+
+| 阶段 | 时长 | 指令 |
+|---|---:|---|
+| `bench_climb` | 4 秒 | `linear.z = +0.20 m/s` |
+| `bench_hold` | 3 秒 | `linear.z = 0.00 m/s` |
+| `bench_descend` | 4 秒 | `linear.z = -0.20 m/s` |
+| `bench_zero` | 2 秒 | `linear.z = 0.00 m/s` |
+
+电机体感不作为通过标准。通过标准以终端日志、任务状态机和 `/mavros/setpoint_velocity/cmd_vel` 话题为准。
+
+硬件要求：
+
+- FCU 通过 USB 连接到板子，默认 `/dev/ttyACM0`，波特率 `921600`。
+- UWB 连接到板子串口，当前默认 `/dev/ttySTM1`，波特率 `115200`。
+- 遥控器已连接飞控，ARM 前油门杆保持最低。
+- 不安装桨叶。
+
+启动 MAVROS：
+
+```bash
+docker exec -d ros2humble bash -c "
+  source /opt/ros/humble/setup.bash
+  source /workspace/uav_delta_capture/install/setup.bash
+  ros2 launch mavros apm.launch fcu_url:=/dev/ttyACM0:921600 > /tmp/mavros.log 2>&1
+"
+```
+
+确认 MAVROS，并按需要观察本地位置：
+
+```bash
+# 确认飞控 heartbeat
+docker exec ros2humble bash -c "grep -E 'HEARTBEAT|connected' /tmp/mavros.log | tail -5"
+
+# 查看 MAVROS 状态
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/state --once"
+
+# 查看本地位置。bench 不会硬等这条，但 real_full 必须依赖它。
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/local_position/pose --once"
+```
+
+启动 bench：
+
+```bash
+docker exec -it ros2humble bash -c "
+  source /opt/ros/humble/setup.bash
+  source /workspace/uav_delta_capture/install/setup.bash
+  ros2 launch uwb_navigation test_mission_bench.launch.py
+"
+```
+
+后台运行并保存日志：
+
+```bash
+docker exec -d ros2humble bash -c "
+  source /opt/ros/humble/setup.bash
+  source /workspace/uav_delta_capture/install/setup.bash
+  ros2 launch uwb_navigation test_mission_bench.launch.py > /tmp/mission_bench.log 2>&1
+"
+```
+
+查看 bench 日志：
+
+```bash
+docker exec ros2humble bash -c "grep -E 'Bench preflight|BENCH RESULT|Core links|Sensor links|Bench warnings|Phase|bench|Arm|Disarm|PAUSED|FAILSAFE|ERROR|WARN' /tmp/mission_bench.log | tail -120"
+```
+
+监测速度链路：
+
+```bash
+# 导航节点发布的速度
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /cmd_vel"
+
+# flight_commander 转发给 MAVROS 的速度
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/setpoint_velocity/cmd_vel"
+```
+
+## real_full 完整任务
+
+用途：执行完整任务状态机。该模式有真实起飞、移动、下降、返航和降落动作，只能在去桨检查、传感器检查、遥控接管验证、场地安全确认之后分阶段测试。
+
+启动前必须确认：
+
+```bash
+# UWB 数据有效
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /uwb_aoa/data --once"
+
+# 飞控状态正常
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /fcu_state --once"
+
+# 本地位置正常
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/local_position/pose --once"
+
+# 遥控器能切出 GUIDED 并接管
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/state --once"
+```
+
+启动完整任务：
+
+```bash
+docker exec -it ros2humble bash -c "
+  source /opt/ros/humble/setup.bash
+  source /workspace/uav_delta_capture/install/setup.bash
+  ros2 launch uwb_navigation test_mission_real_full.launch.py
+"
+```
+
+后台运行并保存日志：
+
+```bash
+docker exec -d ros2humble bash -c "
+  source /opt/ros/humble/setup.bash
+  source /workspace/uav_delta_capture/install/setup.bash
+  ros2 launch uwb_navigation test_mission_real_full.launch.py > /tmp/mission_real_full.log 2>&1
+"
+```
+
+系统集成入口：
+
+```bash
+docker exec -it ros2humble bash -c "
+  source /opt/ros/humble/setup.bash
+  source /workspace/uav_delta_capture/install/setup.bash
+  ros2 launch uwb_navigation uwb_navigation_system.launch.py
+"
+```
+
+## 抓取和投放占位信号
+
+默认配置下，`fake_grasp` 和 `fake_drop` 为 `true`，节点会用计时器自动推进。如果改成 `false`，需要外部模块发布完成信号。
+
+```bash
+# 通知抓取完成
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic pub --once /grasp_done std_msgs/msg/String '{data: done}'"
+
+# 通知投放完成
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic pub --once /drop_done std_msgs/msg/String '{data: done}'"
+```
+
+## 状态和话题监测
+
+```bash
+# 节点列表
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 node list"
+
+# 话题列表
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic list"
+
+# 任务状态
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /test_mission/state --once"
+
+# 任务事件
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /test_mission/event --once"
+
+# UWB 数据
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /uwb_aoa/data --once"
+
+# 飞控聚合状态
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /fcu_state --once"
+
+# 本地位置
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/local_position/pose --once"
+
+# 速度 setpoint 频率
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 10 ros2 topic hz /mavros/setpoint_velocity/cmd_vel"
+
+# UWB 频率
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 10 ros2 topic hz /uwb_aoa/data"
+
+# 本地位置频率
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 10 ros2 topic hz /mavros/local_position/pose"
+```
+
+## 清理残留进程
+
+优先温和清理：
+
+```bash
+docker exec ros2humble bash -c "
+  pkill -f [r]os2\ launch\ uwb_navigation || true
+  pkill -f [t]est_mission_node.py || true
+  pkill -f [u]wb_aoa_driver_node || true
+  pkill -f [f]cu_state_node || true
+  pkill -f [f]light_commander_node || true
+  pkill -f [f]light_state_machine_node || true
+  pkill -f [f]cu_link_monitor_node || true
+"
+```
+
+停止 MAVROS：
+
+```bash
+docker exec ros2humble bash -c "
+  pkill -f [r]os2\ launch\ mavros || true
+  pkill -f [m]avros_node || true
+"
+```
+
+查看残留：
+
+```bash
+docker exec ros2humble bash -c "ps -eo pid,ppid,cmd | grep -E 'mavros|test_mission|uwb_aoa|fcu_state|flight_commander|flight_state_machine|fcu_link_monitor|ros2 launch' | grep -v grep || true"
+```
+
+卡死时强制清理：
+
+```bash
+docker exec ros2humble bash -c "
+  pkill -9 -f [m]avros || true
+  pkill -9 -f [t]est_mission_node.py || true
+  pkill -9 -f [u]wb_aoa_driver_node || true
+  pkill -9 -f [f]cu_state_node || true
+  pkill -9 -f [f]light_commander_node || true
+  pkill -9 -f [f]light_state_machine_node || true
+  pkill -9 -f [f]cu_link_monitor_node || true
+"
+```
+
+最彻底的清场是重启容器：
+
+```bash
+docker restart ros2humble
+```
+
+## 遥控器接管
+
+当前任务节点用飞控模式判断人工接管。`auto_modes` 默认只有 `GUIDED`。如果飞控模式离开 `GUIDED`，节点会发布零速度并进入 `PAUSED_MANUAL`，不会自动恢复任务。
+
+测试方法：
+
+1. 启动 bench 或 real_full。
+2. 用遥控器或地面站把飞控切出 `GUIDED`。
+3. 查看 `/test_mission/state`，应变为 `PAUSED_MANUAL`。
+4. 查看 `/cmd_vel`，应接近零速度。
+5. 需要恢复自主任务时，先清理残留进程，再重新启动对应 launch。
+
+## 关键参数
+
+| 参数 | 说明 |
+|---|---|
+| `mission_mode` | `mock_full`、`bench_velocity` 或 `real_full` |
+| `require_uwb_ready` | `INIT` 阶段是否等待 UWB 数据有效 |
+| `require_local_pose_ready` | `INIT` 阶段是否等待本地位置有效 |
+| `takeoff_altitude` | 起飞和返航阶段使用的固定高度 |
+| `descend_altitude` | 抓取前下降到的高度 |
+| `max_vel_xy` | 水平最大速度 |
+| `max_vel_z` | 垂直最大速度 |
+| `velocity_slew_rate` | 速度变化限幅，用于平滑指令 |
+| `bench_velocity_z` | bench 阶段 Z 轴速度指令幅值 |
+| `bench_climb_sec` / `bench_hold_sec` / `bench_descend_sec` / `bench_zero_sec` | bench 速度曲线各阶段时长 |
+| `bench_sensor_timeout` | bench 自检判断传感器消息是否新鲜的超时时间 |
+| `auto_modes` | 允许自主任务继续运行的飞控模式列表 |
+| `fake_grasp` / `fake_drop` | 是否用计时器代替真实抓取/投放完成信号 |
+
+## 常见问题
+
+1. MAVROS 没有 heartbeat：检查 FCU USB、`/dev/ttyACM0`、波特率和飞控供电。
+2. 本地位置没有数据：检查光流/测距是否被飞控正常融合，室内无 GPS 时这条链路很关键。
+3. bench 日志里 UWB 是 `WAIT`：桌面速度链路测试仍可继续；检查 `/uwb_aoa/data` 是否有数据，UWB 串口应为 `/dev/ttySTM1`，参数名是 `serial_baud`。
+4. bench 日志里 local_pose 是 `WAIT`：桌面速度链路测试仍可继续；这说明飞控还没输出本地位置，后续 real_full 前必须单独解决。
+5. bench 结果是 `PASS_WITH_WARNINGS`：核心 ARM/速度/DISARM 成功，但至少一个传感器或模式服务未就绪；可以继续桌面验证，但不能直接进入 real_full。
+6. bench 结果是 `FAIL`：核心链路失败，先看 `Core links` 和 `/tmp/mavros.log`。
+7. ARM 被拒：查看 `/tmp/mavros.log` 中的 `PreArm` 或 `Arm` 信息，常见原因是油门不在最低、模式不可解锁、传感器预检失败。
+8. 遥控接管后任务不继续：这是当前设计，进入 `PAUSED_MANUAL` 后需要重启任务节点。
+9. 改了 launch/config 但没生效：确认已经重新编译并重新 source `/workspace/uav_delta_capture/install/setup.bash`。

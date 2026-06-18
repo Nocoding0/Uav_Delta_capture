@@ -1,209 +1,93 @@
-# UAV-Delta 无人机协同捕获系统
+# UWB 无人机抓取项目
 
-基于 STM32MP257F-DK（Cortex-A35 + Cortex-M33 + NPU）的无人机与 Delta 机械臂协同捕获系统。
+本项目用于验证一套资源受限条件下的室内无人机自主抓取流程。系统以 STM32MP257F-DK 作为板端计算平台，CUAVv5 飞控负责姿态、定高、本地位置估计和基础飞行控制，UWB AOA 模块提供目标相对距离与角度信息，视觉和机械臂模块负责最后阶段的精定位与抓取。
 
-## 系统架构
+当前主线目标不是做完整 SLAM，而是在有限场地内先验证“起飞、悬停、UWB 引导接近目标、下降、等待抓取、复飞、返航、投放、降落”这条任务链路是否可行。
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Cortex-A35 (Linux + ROS 2 Humble)               │
-│                                                                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
-│  │  uwb_driver   │  │uwb_navigation│  │  fcu_bridge   │  │vision_bridge │ │
-│  │  UWB 数据采集 │  │ UWB 导航控制 │  │  飞控通信桥接 │  │  视觉桥接    │ │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘ │
-│         │                 │                 │                 │          │
-│  ┌──────┴───────┐  ┌──────┴───────┐  ┌──────┴───────┐                │
-│  │   safety      │  │delta_kinemat.│  │ uav_delta_msgs│                │
-│  │  安全管理     │  │  臂运动学    │  │  自定义消息   │                │
-│  └──────────────┘  └──────────────┘  └──────────────┘                │
-│                                                                         │
-│  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │                     Docker (ros2humble)                          │  │
-│  │  ros-humble-desktop-full + mavros + vision_opencv               │  │
-│  └──────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────┘
-        │ UART            │ UART/USB          │ Ethernet
-   ┌────┴────┐       ┌────┴────┐         ┌────┴────┐
-   │ UWB模块 │       │ 飞控    │         │ Jetson  │
-   │ ALX-AOA │       │ PX4/ArduPilot│    │ 视觉处理│
-   └─────────┘       └─────────┘         └─────────┘
-```
+## 系统组成
 
-## 包结构
+| 模块 | 作用 |
+|---|---|
+| STM32MP257F-DK | 运行 ROS 2、任务状态机、UWB 数据链路、飞控桥接节点 |
+| CUAVv5 飞控 | 执行飞行控制、ARM/DISARM、模式切换、速度 setpoint、降落命令 |
+| UTF01 光流测距一体模块 | 接入飞控，由飞控融合后输出室内本地位置估计 |
+| UWB AOA 模块 | 单基站挂在无人机上，目标物体放置 tag，输出距离、方位角、俯仰角 |
+| 视觉模块 | 目标上方近距离精定位，当前由队友模块接入 |
+| 机械臂/抓取模块 | 执行抓取和投放，当前导航侧预留完成信号接口 |
 
-| 包名 | 功能 | 关键节点 |
-|------|------|----------|
-| **uwb_driver** | UWB AOA 数据采集与滤波 | `uwb_aoa_driver_node` |
-| **uwb_navigation** | UWB 导航控制与任务规划 | `uwb_mission_planner_node` |
-| **fcu_bridge** | 飞控通信桥接 | `fcu_state_node`, `attitude_publisher_node`, `flight_commander_node` |
-| **vision_bridge** | 视觉坐标变换桥接 | `vision_transform_node`, `perception_node` |
-| **safety** | 安全管理与故障处理 | `failsafe_manager_node` |
-| **uav_delta_msgs** | 自定义消息/服务/动作定义 | - |
-| **delta_kinematics** | Delta 机械臂运动学 | `delta_kinematics_node` |
-| **vision_test** | 视觉测试工具 | `vision_test_node` |
+## 导航思路
 
-## 快速开始
+无人机起飞后先在固定高度悬停。接近目标阶段主要使用 UWB tag 的相对观测信息，控制无人机平滑移动到目标上方；下降到抓取高度后，导航节点悬停并等待视觉/抓取模块完成。抓取完成后，无人机复飞到安全高度，返航阶段使用飞控发布的 `/mavros/local_position/pose` 和起飞时记录的本地原点，不再依赖 UWB。到达起飞点上方后进入投放占位阶段，最后降落。
 
-### 环境要求
+该方案依赖飞控在室内能通过光流/测距维持可用的本地位置估计。UWB 当前只承担目标相对引导，不承担全局建图或完整定位。
 
-- STM32MP257F-DK 开发板
-- Docker 环境（镜像: `my_ros2_humble:latest`）
-- 飞控（PX4/ArduPilot）通过 MAVROS 连接
-- UWB ALX-AOA-FIT 模块（UART 115200）
+## 代码框架
 
-### 启动 Docker 环境
-
-```bash
-# 启动 Docker 守护进程（如果未运行）
-nohup dockerd --data-root /usr/local/docker > /tmp/dockerd.log 2>&1 &
-
-# 进入 ROS 2 容器
-docker exec -it ros2humble bash
+```text
+uav_delta_capture/src/
+├── fcu_bridge/       # 项目节点与 MAVROS/飞控之间的桥接
+├── safety/           # 安全检查和预留 failsafe 工具
+├── uwb_driver/       # UWB AOA 串口采集、协议解析、滤波和话题发布
+├── uwb_navigation/   # 当前主任务状态机、UWB 导航、bench/mock/real launch
+└── vision_bridge/    # 视觉坐标转换和视觉侧桥接
 ```
 
-### 编译工作空间
+## 包职责
 
-```bash
-cd /usr/local/Uav_Delta_capture/uav_delta_capture
-colcon build --symlink-install
-source install/setup.bash
+### `uwb_navigation`
+
+当前自主任务主线。核心节点是 Python 版本的 `test_mission_node.py`，负责三种运行模式：
+
+- `mock_full`：纯软件 mock，全流程状态机连通性测试。
+- `bench_velocity`：桌面级去桨验证，FCU 连接是硬条件，UWB 和本地位置只做在线状态监测；ARM 后发送短时间 Z 轴速度曲线，再 DISARM。
+- `real_full`：完整自主任务流程，抓取和投放可以先用假信号或计时器占位。
+
+具体运行命令、话题监测、状态机说明见 `uav_delta_capture/src/uwb_navigation/README.md`。
+
+### `uwb_driver`
+
+负责读取 UWB AOA 模块串口数据，解析距离、方位角、俯仰角等字段，滤波后发布 `uwb_aoa/data`。导航节点只消费该话题，不直接操作串口。
+
+### `fcu_bridge`
+
+负责把 MAVROS 的飞控状态、本地位置、电池和估计器信息整理成项目内部状态，并把导航节点发布的 `cmd_vel` 转发到 MAVROS 速度 setpoint。该包也提供 `flight_command` 服务，用于 ARM、DISARM、起飞、降落等飞控命令。
+
+### `safety`
+
+当前主线安全逻辑主要在 `uwb_navigation` 和 `fcu_bridge` 内完成。`safety` 包保留后续更完整的 failsafe 管理能力。
+
+### `vision_bridge`
+
+视觉侧桥接和坐标转换入口。当前 UWB 导航主线只预留抓取完成、投放完成信号，不直接实现视觉识别和手眼标定。
+
+## 关键数据流
+
+```text
+UWB 模块
+  -> uwb_driver
+  -> /uwb_aoa/data
+  -> uwb_navigation/test_mission_node.py
+  -> /cmd_vel
+  -> fcu_bridge/flight_commander_node
+  -> /mavros/setpoint_velocity/cmd_vel
+  -> CUAVv5 飞控
 ```
 
-### 运行示例
-
-```bash
-# 启动完整的 UWB 导航系统
-ros2 launch uwb_navigation uwb_navigation_system.launch.py
-
-# 或单独启动各模块
-ros2 launch uwb_driver uwb_aoa_driver.launch.py
-ros2 launch uwb_navigation uwb_mission_planner.launch.py
-ros2 launch fcu_bridge attitude_publisher.launch.py
-ros2 launch vision_bridge vision_transform.launch.py
-ros2 launch safety failsafe_manager.launch.py
+```text
+CUAVv5 + 光流/测距融合
+  -> MAVROS
+  -> /mavros/local_position/pose
+  -> fcu_bridge + uwb_navigation
+  -> 起飞点记录、返航、链路健康判断
 ```
 
-## 核心节点说明
+## 当前开发重点
 
-### uwb_aoa_driver_node（UWB 数据采集）
+短期目标是先完成可验证的 UWB 半自主任务链路：
 
-从 UWB 模块读取 AOA 数据，解析 37 字节帧，应用卡尔曼滤波。
+1. mock 模式跑通完整状态机。
+2. bench 模式在不上桨叶时验证 FCU、ARM、速度 setpoint、DISARM 链路，同时观察 UWB 和本地位置是否在线。
+3. real_full 模式低风险分阶段验证起飞、悬停、UWB 接近、下降、复飞、返航、降落。
+4. 视觉和机械臂模块接入后，把 `grasp_done`、`drop_done` 从占位信号替换成真实完成信号。
 
-- **订阅**: 无（直接读取串口）
-- **发布**: `uwb_aoa/data`（`UavDeltaMsgs/UwbAoa`）
-- **参数**: `serial_port`, `baud_rate`, `kalman_q`, `kalman_r`
-
-### uwb_mission_planner_node（任务规划器）
-
-UWB 导航状态机，控制无人机按预设路径飞行。
-
-- **订阅**: `uwb_aoa/data`, `mavros/state`, `mavros/local_position/pose`
-- **发布**: `mavros/setpoint_velocity/cmd_vel_unstamped`, `uwb_mission/state`, `uwb_mission/event`
-- **状态**: IDLE → ARMING → TAKEOFF → HOVER_TAKEOFF → MOVE_ABOVE → HOVER_ABOVE → DESCEND → HOVER_FINAL → DONE
-
-### attitude_publisher_node（姿态发布）
-
-从 MAVROS 提取姿态角并发布。
-
-- **订阅**: `mavros/local_position/pose`, `mavros/imu/data`
-- **发布**: `fcu/local_attitude`, `fcu/imu_attitude`
-
-### vision_transform_node（视觉变换）
-
-使用 TF2 将视觉目标从相机坐标系变换到机械臂坐标系。
-
-- **订阅**: `vision/target_offset`
-- **发布**: `target_point`
-- **TF**: `camera_optical_frame` → `delta_base_link`
-
-### failsafe_manager_node（安全管理）
-
-监控系统状态，在异常时触发保护动作。
-
-- **订阅**: `mavros/state`, `mavros/battery`, `uwb_mission/state`
-- **发布**: `mavros/setpoint_velocity/cmd_vel_unstamped`, `failsafe/status`
-
-## 关键话题
-
-| 话题 | 消息类型 | 说明 |
-|------|----------|------|
-| `uwb_aoa/data` | `UavDeltaMsgs/UwbAoa` | UWB 测距/角度数据 |
-| `uwb_mission/state` | `std_msgs/String` | 任务状态 |
-| `uwb_mission/event` | `std_msgs/String` | 任务事件 |
-| `fcu/local_attitude` | `geometry_msgs/Vector3Stamped` | 飞控姿态角 |
-| `target_point` | `geometry_msgs/PointStamped` | 视觉目标点（臂坐标系） |
-| `cmd_vel` | `geometry_msgs/Twist` | 速度控制指令 |
-
-## UWB 协议说明
-
-ALX-AOA-FIT 模块使用 UART 115200 通信，帧格式：
-
-```
-帧头(2B) + 长度(2B) + 命令(2B) + 数据(28B) + 校验(1B) + 帧尾(2B) = 37 字节
-```
-
-数据字段：
-- `Distance`: uint32, 距离（cm）
-- `Azimuth`: int16, 水平角度（°, ±90°）
-- `Elevation`: int16, 垂直角度（°, ±30°）
-
-精度：距离 ±10cm，角度 ±2°
-
-## 配置文件
-
-各节点配置文件位于对应包的 `config/` 目录：
-
-```
-uwb_driver/config/uwb_aoa_driver.yaml
-uwb_navigation/config/uwb_mission_planner.yaml
-fcu_bridge/config/attitude_publisher.yaml
-vision_bridge/config/vision_transform.yaml
-```
-
-## 项目结构
-
-```
-uav_delta_capture/
-├── src/
-│   ├── uav_delta_msgs/          # 自定义消息
-│   ├── delta_kinematics/        # 机械臂运动学
-│   ├── uwb_driver/              # UWB 数据采集
-│   │   ├── src/
-│   │   ├── config/
-│   │   └── launch/
-│   ├── uwb_navigation/          # UWB 导航控制
-│   │   ├── src/
-│   │   ├── config/
-│   │   └── launch/
-│   ├── fcu_bridge/              # 飞控通信
-│   │   ├── src/
-│   │   ├── config/
-│   │   └── launch/
-│   ├── vision_bridge/           # 视觉桥接
-│   │   ├── src/
-│   │   ├── config/
-│   │   └── launch/
-│   ├── safety/                  # 安全管理
-│   │   ├── src/
-│   │   └── launch/
-│   └── vision_test/             # 视觉测试
-```
-
-## 开发说明
-
-### 添加新节点
-
-1. 在对应包的 `src/` 下创建源文件
-2. 更新 `CMakeLists.txt` 添加可执行文件
-3. 更新 `package.xml` 添加依赖
-4. 创建配置文件（如需要）
-5. 创建启动文件
-
-### 消息定义
-
-自定义消息在 `uav_delta_msgs/msg/` 下定义，编译后自动生成头文件。
-
-## 许可证
-
-[待定]
+各包的具体启动、监测和清理命令放在对应包 README 中，根目录 README 只维护项目整体说明。

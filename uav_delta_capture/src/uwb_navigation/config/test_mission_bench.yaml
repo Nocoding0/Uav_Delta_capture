@@ -17,15 +17,17 @@ test_mission_node:
     arm_mode: ALT_HOLD
 
     # Bench velocity smoke test. No propellers.
-    bench_velocity_z: 0.15
-    bench_climb_sec: 2.0
-    bench_hold_sec: 2.0
-    bench_descend_sec: 2.0
-    bench_zero_sec: 1.0
+    bench_velocity_z: 0.20
+    bench_climb_sec: 4.0
+    bench_hold_sec: 3.0
+    bench_descend_sec: 4.0
+    bench_zero_sec: 2.0
+    bench_sensor_timeout: 2.0
 
-    # Preflight links to verify on the bench.
-    require_uwb_ready: true
-    require_local_pose_ready: true
+    # Bench mode records UWB/local-pose readiness but does not block on them.
+    # This mode is for no-propeller ARM + velocity-setpoint link testing.
+    require_uwb_ready: false
+    require_local_pose_ready: false
     uwb_signal_timeout: 3.0
     local_pose_timeout: 1.0
 

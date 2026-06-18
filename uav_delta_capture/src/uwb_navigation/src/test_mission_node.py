@@ -13,10 +13,12 @@ from enum import Enum
 
 import rclpy
 from geometry_msgs.msg import PoseStamped, TwistStamped
+from mavros_msgs.msg import OpticalFlowRad, State as MavrosState
 from mavros_msgs.srv import SetMode
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import Range
 from std_msgs.msg import String
 
 from uav_delta_msgs.msg import FcuState, UwbAoa
@@ -72,6 +74,15 @@ class TestMissionNode(Node):
         self.fcu_state_topic = self.declare_parameter("fcu_state_topic", "fcu_state").value
         self.local_pose_topic = self.declare_parameter(
             "local_pose_topic", "/mavros/local_position/pose"
+        ).value
+        self.mavros_state_topic = self.declare_parameter(
+            "mavros_state_topic", "/mavros/state"
+        ).value
+        self.rangefinder_topic = self.declare_parameter(
+            "rangefinder_topic", "/mavros/rangefinder_pub"
+        ).value
+        self.optical_flow_topic = self.declare_parameter(
+            "optical_flow_topic", "/mavros/optical_flow/raw/optical_flow"
         ).value
         self.fcu_link_topic = self.declare_parameter("fcu_link_topic", "fcu_link/status").value
         self.cmd_vel_topic = self.declare_parameter("cmd_vel_topic", "cmd_vel").value
@@ -137,6 +148,7 @@ class TestMissionNode(Node):
         self.bench_hold_sec = self.declare_parameter("bench_hold_sec", 2.0).value
         self.bench_descend_sec = self.declare_parameter("bench_descend_sec", 2.0).value
         self.bench_zero_sec = self.declare_parameter("bench_zero_sec", 1.0).value
+        self.bench_sensor_timeout = self.declare_parameter("bench_sensor_timeout", 2.0).value
 
         self.takeoff_altitude = max(0.5, self.takeoff_altitude)
         self.descend_altitude = max(0.2, self.descend_altitude)
@@ -169,22 +181,46 @@ class TestMissionNode(Node):
         self._data_lock = threading.Lock()
         self._last_uwb = None
         self._last_fcu_state = None
+        self._last_mavros_state = None
         self._last_local_pose = None
+        self._last_rangefinder = None
+        self._last_optical_flow = None
         self._last_link_status = "OK"
         self._has_uwb = False
         self._has_fcu = False
+        self._has_mavros_state = False
         self._has_pose = False
+        self._has_rangefinder = False
+        self._has_optical_flow = False
         self._last_uwb_time = self.get_clock().now()
+        self._last_mavros_state_time = self.get_clock().now()
         self._last_pose_time = self.get_clock().now()
+        self._last_rangefinder_time = self.get_clock().now()
+        self._last_optical_flow_time = self.get_clock().now()
         self._grasp_done = False
         self._drop_done = False
+        self._bench_arm_ok = False
+        self._bench_velocity_started = False
+        self._bench_velocity_done = False
+        self._bench_disarm_ok = False
+        self._bench_guided_ok = None
+        self._bench_result_reported = False
 
         cb_group = ReentrantCallbackGroup()
 
         self.uwb_sub = self.create_subscription(UwbAoa, self.uwb_aoa_topic, self._uwb_callback, 10)
         self.fcu_sub = self.create_subscription(FcuState, self.fcu_state_topic, self._fcu_callback, 10)
+        self.mavros_state_sub = self.create_subscription(
+            MavrosState, self.mavros_state_topic, self._mavros_state_callback, 10
+        )
         self.pose_sub = self.create_subscription(
             PoseStamped, self.local_pose_topic, self._pose_callback, SENSOR_QOS
+        )
+        self.rangefinder_sub = self.create_subscription(
+            Range, self.rangefinder_topic, self._rangefinder_callback, SENSOR_QOS
+        )
+        self.optical_flow_sub = self.create_subscription(
+            OpticalFlowRad, self.optical_flow_topic, self._optical_flow_callback, SENSOR_QOS
         )
         self.link_sub = self.create_subscription(String, self.fcu_link_topic, self._link_callback, 10)
         self.grasp_sub = self.create_subscription(String, self.grasp_done_topic, self._grasp_callback, 10)
@@ -225,11 +261,29 @@ class TestMissionNode(Node):
             self._last_fcu_state = msg
             self._has_fcu = True
 
+    def _mavros_state_callback(self, msg: MavrosState):
+        with self._data_lock:
+            self._last_mavros_state = msg
+            self._has_mavros_state = True
+            self._last_mavros_state_time = self.get_clock().now()
+
     def _pose_callback(self, msg: PoseStamped):
         with self._data_lock:
             self._last_local_pose = msg
             self._has_pose = True
             self._last_pose_time = self.get_clock().now()
+
+    def _rangefinder_callback(self, msg: Range):
+        with self._data_lock:
+            self._last_rangefinder = msg
+            self._has_rangefinder = True
+            self._last_rangefinder_time = self.get_clock().now()
+
+    def _optical_flow_callback(self, msg: OpticalFlowRad):
+        with self._data_lock:
+            self._last_optical_flow = msg
+            self._has_optical_flow = True
+            self._last_optical_flow_time = self.get_clock().now()
 
     def _link_callback(self, msg: String):
         with self._data_lock:
@@ -278,7 +332,7 @@ class TestMissionNode(Node):
             return False
 
         link = self._last_link_status
-        if link == "LOST":
+        if link == "LOST" and self.phase != Phase.BENCH_VELOCITY:
             if self.phase != Phase.RECOVERING:
                 self._publish_event("link_recovering")
                 self._transition(Phase.RECOVERING)
@@ -329,6 +383,38 @@ class TestMissionNode(Node):
             age = (self.get_clock().now() - self._last_pose_time).nanoseconds / 1e9
             return age <= self.local_pose_timeout
 
+    def _message_fresh(self, stamp_time, timeout_sec=None) -> bool:
+        timeout = self.bench_sensor_timeout if timeout_sec is None else timeout_sec
+        age = (self.get_clock().now() - stamp_time).nanoseconds / 1e9
+        return age <= timeout
+
+    def _mavros_state_ready(self) -> bool:
+        with self._data_lock:
+            return (
+                self._has_mavros_state
+                and self._last_mavros_state is not None
+                and self._message_fresh(self._last_mavros_state_time)
+            )
+
+    def _rangefinder_ready(self) -> bool:
+        with self._data_lock:
+            if not self._has_rangefinder or self._last_rangefinder is None:
+                return False
+            msg = self._last_rangefinder
+            if not math.isfinite(msg.range):
+                return False
+            if msg.range < msg.min_range or msg.range > msg.max_range:
+                return False
+            return self._message_fresh(self._last_rangefinder_time)
+
+    def _optical_flow_ready(self) -> bool:
+        with self._data_lock:
+            if not self._has_optical_flow or self._last_optical_flow is None:
+                return False
+            return self._last_optical_flow.quality > 0 and self._message_fresh(
+                self._last_optical_flow_time
+            )
+
     def _fcu_connected(self) -> bool:
         if self.use_mock:
             return True
@@ -361,10 +447,135 @@ class TestMissionNode(Node):
                 return ""
             return self._last_fcu_state.mode or ""
 
+    def _bench_snapshot(self):
+        with self._data_lock:
+            fcu = self._last_fcu_state
+            mavros_state = self._last_mavros_state
+            uwb = self._last_uwb
+            rangefinder = self._last_rangefinder
+            flow = self._last_optical_flow
+
+        fcu_ok = self._fcu_connected()
+        mavros_ok = self._mavros_state_ready()
+        rc_ok = bool(mavros_ok and mavros_state.manual_input)
+        uwb_ok = self._uwb_valid_and_fresh()
+        pose_ok = self._local_pose_ready()
+        range_ok = self._rangefinder_ready()
+        flow_ok = self._optical_flow_ready()
+        set_mode_ok = self.mavros_set_mode_client.service_is_ready()
+
+        warnings = []
+        if not rc_ok:
+            warnings.append("RC/manual_input not confirmed")
+        if not uwb_ok:
+            warnings.append("UWB not fresh")
+        if not range_ok:
+            warnings.append("rangefinder not fresh")
+        if not flow_ok:
+            warnings.append("optical_flow not fresh")
+        if not pose_ok:
+            warnings.append("local_position missing: real_full not ready")
+        if not set_mode_ok:
+            warnings.append("MAVROS set_mode service not ready")
+        if self._bench_guided_ok is False:
+            warnings.append("GUIDED mode switch rejected/unavailable")
+
+        return {
+            "fcu_ok": fcu_ok,
+            "fcu_mode": (fcu.mode if fcu else ""),
+            "fcu_armed": bool(fcu.armed) if fcu else False,
+            "mavros_ok": mavros_ok,
+            "rc_ok": rc_ok,
+            "uwb_ok": uwb_ok,
+            "uwb_distance": uwb.distance_m if uwb else None,
+            "uwb_azimuth": uwb.azimuth_deg if uwb else None,
+            "pose_ok": pose_ok,
+            "range_ok": range_ok,
+            "range_m": rangefinder.range if rangefinder else None,
+            "flow_ok": flow_ok,
+            "flow_quality": flow.quality if flow else None,
+            "set_mode_ok": set_mode_ok,
+            "warnings": warnings,
+        }
+
+    def _format_bench_snapshot(self, snapshot):
+        def status(ok):
+            return "OK" if ok else "WAIT"
+
+        uwb_text = status(snapshot["uwb_ok"])
+        if snapshot["uwb_ok"] and snapshot["uwb_distance"] is not None:
+            uwb_text += f" d={snapshot['uwb_distance']:.2f}m az={snapshot['uwb_azimuth']:.1f}deg"
+
+        range_text = status(snapshot["range_ok"])
+        if snapshot["range_ok"] and snapshot["range_m"] is not None:
+            range_text += f" {snapshot['range_m']:.2f}m"
+
+        flow_text = status(snapshot["flow_ok"])
+        if snapshot["flow_quality"] is not None:
+            flow_text += f" q={snapshot['flow_quality']}"
+
+        return (
+            f"FCU={status(snapshot['fcu_ok'])} "
+            f"mode={snapshot['fcu_mode'] or '-'} armed={str(snapshot['fcu_armed']).lower()} "
+            f"RC={status(snapshot['rc_ok'])} "
+            f"UWB={uwb_text} "
+            f"rangefinder={range_text} "
+            f"optical_flow={flow_text} "
+            f"local_pose={status(snapshot['pose_ok'])} "
+            f"set_mode_srv={status(snapshot['set_mode_ok'])}"
+        )
+
+    def _report_bench_result(self, force_fail_reason=None):
+        if self._bench_result_reported:
+            return
+        self._bench_result_reported = True
+
+        snapshot = self._bench_snapshot()
+        core_ok = (
+            self._bench_arm_ok
+            and self._bench_velocity_started
+            and self._bench_velocity_done
+            and self._bench_disarm_ok
+        )
+        warnings = list(snapshot["warnings"])
+        if self._bench_guided_ok is None:
+            warnings.append("GUIDED mode switch result unknown")
+        if force_fail_reason:
+            warnings.append(force_fail_reason)
+
+        if not core_ok or force_fail_reason:
+            result = "FAIL"
+        elif warnings:
+            result = "PASS_WITH_WARNINGS"
+        else:
+            result = "PASS"
+
+        self.get_logger().info("========== BENCH RESULT ==========")
+        self.get_logger().info(f"BENCH RESULT: {result}")
+        self.get_logger().info(
+            "Core links: "
+            f"ARM={'OK' if self._bench_arm_ok else 'FAIL'} "
+            f"velocity_profile={'OK' if self._bench_velocity_done else 'FAIL'} "
+            f"DISARM={'OK' if self._bench_disarm_ok else 'FAIL'}"
+        )
+        self.get_logger().info(f"Sensor links: {self._format_bench_snapshot(snapshot)}")
+        if warnings:
+            self.get_logger().warn("Bench warnings: " + "; ".join(warnings))
+        self.get_logger().info("==================================")
+
     def _tick_init(self):
         fcu_ok = self._fcu_connected()
-        uwb_ok = (not self.require_uwb_ready) or self._uwb_valid_and_fresh()
-        pose_ok = (not self.require_local_pose_ready) or self._local_pose_ready()
+        uwb_ready = self._uwb_valid_and_fresh()
+        pose_ready = self._local_pose_ready()
+        uwb_ok = (not self.require_uwb_ready) or uwb_ready
+        pose_ok = (not self.require_local_pose_ready) or pose_ready
+
+        if self.mission_mode == "bench_velocity":
+            snapshot = self._bench_snapshot()
+            self.get_logger().info(
+                "Bench preflight: " + self._format_bench_snapshot(snapshot),
+                throttle_duration_sec=5.0,
+            )
 
         if fcu_ok and uwb_ok and pose_ok:
             self._record_origin()
@@ -394,6 +605,8 @@ class TestMissionNode(Node):
 
         if self._command_retry_count > 20:
             self.get_logger().error("ARM retry limit exceeded")
+            if self.mission_mode == "bench_velocity":
+                self._report_bench_result("ARM retry limit exceeded")
             self._transition(Phase.FAILSAFE)
             return
 
@@ -410,9 +623,11 @@ class TestMissionNode(Node):
         self.get_logger().info(f"Arm OK: {msg}")
         self._publish_event("armed")
         self._command_retry_count = 0
+        if self.mission_mode == "bench_velocity":
+            self._bench_arm_ok = True
 
         if self.mission_mode == "bench_velocity":
-            self._call_mavros_set_mode("GUIDED")
+            self._call_mavros_set_mode("GUIDED", warn_only=True)
             self.bench_start_time = self.get_clock().now()
             self._transition(Phase.BENCH_VELOCITY)
             return
@@ -443,6 +658,7 @@ class TestMissionNode(Node):
             label = "bench_zero"
         else:
             self._publish_velocity(0.0, 0.0, 0.0)
+            self._bench_velocity_done = True
             if not self._desktop_disarm_done and not self._pending_command:
                 self._pending_command = True
                 self.get_logger().info("Bench velocity profile complete, disarming")
@@ -451,13 +667,16 @@ class TestMissionNode(Node):
 
         self.get_logger().info(f"{label}: vz={vz:.2f} m/s", throttle_duration_sec=1.0)
         self._publish_velocity(0.0, 0.0, vz)
+        self._bench_velocity_started = True
 
     def _on_bench_disarm(self, success: bool, msg: str):
         self._pending_command = False
         self._desktop_disarm_done = True
+        self._bench_disarm_ok = success
         self.get_logger().info(f"Bench disarm: {'OK' if success else 'FAIL'} - {msg}")
         self._publish_event("bench_velocity_done")
         self._transition(Phase.DONE)
+        self._report_bench_result(None if success else "DISARM failed")
 
     def _tick_takeoff(self):
         if self._pending_command:
@@ -840,11 +1059,14 @@ class TestMissionNode(Node):
 
         future.add_done_callback(_done)
 
-    def _call_mavros_set_mode(self, mode_str: str):
+    def _call_mavros_set_mode(self, mode_str: str, warn_only: bool = False):
         if self.use_mock:
             return
         if not self.mavros_set_mode_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().error("MAVROS set_mode service not available")
+            if self.mission_mode == "bench_velocity" and mode_str == "GUIDED":
+                self._bench_guided_ok = False
+            log = self.get_logger().warn if warn_only else self.get_logger().error
+            log("MAVROS set_mode service not available")
             return
         req = SetMode.Request()
         req.custom_mode = mode_str
@@ -853,9 +1075,14 @@ class TestMissionNode(Node):
         def done(fut):
             try:
                 result = fut.result()
+                if self.mission_mode == "bench_velocity" and mode_str == "GUIDED":
+                    self._bench_guided_ok = bool(result.mode_sent)
                 self.get_logger().info(f"MAVROS SetMode({mode_str}): mode_sent={result.mode_sent}")
             except Exception as exc:
-                self.get_logger().error(f"SetMode failed: {exc}")
+                if self.mission_mode == "bench_velocity" and mode_str == "GUIDED":
+                    self._bench_guided_ok = False
+                log = self.get_logger().warn if warn_only else self.get_logger().error
+                log(f"SetMode failed: {exc}")
 
         future.add_done_callback(done)
 
@@ -867,8 +1094,10 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
