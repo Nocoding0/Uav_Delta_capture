@@ -23,6 +23,7 @@ test_mission_node:
     bench_descend_sec: 4.0
     bench_zero_sec: 2.0
     bench_sensor_timeout: 2.0
+    bench_exit_on_complete: true
 
     # Bench mode records UWB/local-pose readiness but does not block on them.
     # This mode is for no-propeller ARM + velocity-setpoint link testing.

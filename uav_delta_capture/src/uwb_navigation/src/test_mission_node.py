@@ -13,7 +13,7 @@ from enum import Enum
 
 import rclpy
 from geometry_msgs.msg import PoseStamped, TwistStamped
-from mavros_msgs.msg import OpticalFlowRad, State as MavrosState
+from mavros_msgs.msg import OpticalFlow, State as MavrosState
 from mavros_msgs.srv import SetMode
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
@@ -149,6 +149,9 @@ class TestMissionNode(Node):
         self.bench_descend_sec = self.declare_parameter("bench_descend_sec", 2.0).value
         self.bench_zero_sec = self.declare_parameter("bench_zero_sec", 1.0).value
         self.bench_sensor_timeout = self.declare_parameter("bench_sensor_timeout", 2.0).value
+        self.bench_exit_on_complete = self.declare_parameter(
+            "bench_exit_on_complete", True
+        ).value
 
         self.takeoff_altitude = max(0.5, self.takeoff_altitude)
         self.descend_altitude = max(0.2, self.descend_altitude)
@@ -205,6 +208,7 @@ class TestMissionNode(Node):
         self._bench_disarm_ok = False
         self._bench_guided_ok = None
         self._bench_result_reported = False
+        self._shutdown_requested = False
 
         cb_group = ReentrantCallbackGroup()
 
@@ -220,7 +224,7 @@ class TestMissionNode(Node):
             Range, self.rangefinder_topic, self._rangefinder_callback, SENSOR_QOS
         )
         self.optical_flow_sub = self.create_subscription(
-            OpticalFlowRad, self.optical_flow_topic, self._optical_flow_callback, SENSOR_QOS
+            OpticalFlow, self.optical_flow_topic, self._optical_flow_callback, SENSOR_QOS
         )
         self.link_sub = self.create_subscription(String, self.fcu_link_topic, self._link_callback, 10)
         self.grasp_sub = self.create_subscription(String, self.grasp_done_topic, self._grasp_callback, 10)
@@ -279,7 +283,7 @@ class TestMissionNode(Node):
             self._has_rangefinder = True
             self._last_rangefinder_time = self.get_clock().now()
 
-    def _optical_flow_callback(self, msg: OpticalFlowRad):
+    def _optical_flow_callback(self, msg: OpticalFlow):
         with self._data_lock:
             self._last_optical_flow = msg
             self._has_optical_flow = True
@@ -484,6 +488,11 @@ class TestMissionNode(Node):
             "fcu_ok": fcu_ok,
             "fcu_mode": (fcu.mode if fcu else ""),
             "fcu_armed": bool(fcu.armed) if fcu else False,
+            "estimator_ok": bool(fcu.estimator_ok) if fcu else False,
+            "attitude_ok": bool(fcu.attitude_status) if fcu else False,
+            "vel_horiz_ok": bool(fcu.vel_horiz_status) if fcu else False,
+            "vel_vert_ok": bool(fcu.vel_vert_status) if fcu else False,
+            "pos_horiz_ok": bool(fcu.pos_horiz_status) if fcu else False,
             "mavros_ok": mavros_ok,
             "rc_ok": rc_ok,
             "uwb_ok": uwb_ok,
@@ -525,6 +534,19 @@ class TestMissionNode(Node):
             f"set_mode_srv={status(snapshot['set_mode_ok'])}"
         )
 
+    def _format_real_preflight_snapshot(self, snapshot):
+        def status(ok):
+            return "OK" if ok else "WAIT"
+
+        estimator_text = (
+            f"estimator={status(snapshot['estimator_ok'])} "
+            f"att={status(snapshot['attitude_ok'])} "
+            f"vel_h={status(snapshot['vel_horiz_ok'])} "
+            f"vel_v={status(snapshot['vel_vert_ok'])} "
+            f"pos_abs={status(snapshot['pos_horiz_ok'])}"
+        )
+        return f"{self._format_bench_snapshot(snapshot)} {estimator_text}"
+
     def _report_bench_result(self, force_fail_reason=None):
         if self._bench_result_reported:
             return
@@ -561,7 +583,20 @@ class TestMissionNode(Node):
         self.get_logger().info(f"Sensor links: {self._format_bench_snapshot(snapshot)}")
         if warnings:
             self.get_logger().warn("Bench warnings: " + "; ".join(warnings))
+        if result == "PASS":
+            self.get_logger().info("Bench next step: desktop bench is clean; real_full still needs field safety checks.")
+        elif result == "PASS_WITH_WARNINGS":
+            self.get_logger().warn(
+                "Bench next step: core desktop test passed, but resolve warnings before real_full."
+            )
+        else:
+            self.get_logger().error("Bench next step: stop and fix core links before any further flight test.")
         self.get_logger().info("==================================")
+        if self.mission_mode == "bench_velocity" and self.bench_exit_on_complete:
+            self._shutdown_requested = True
+
+    def should_exit(self):
+        return self._shutdown_requested
 
     def _tick_init(self):
         fcu_ok = self._fcu_connected()
@@ -576,6 +611,12 @@ class TestMissionNode(Node):
                 "Bench preflight: " + self._format_bench_snapshot(snapshot),
                 throttle_duration_sec=5.0,
             )
+        elif self.mission_mode == "real_full":
+            snapshot = self._bench_snapshot()
+            self.get_logger().info(
+                "Real preflight: " + self._format_real_preflight_snapshot(snapshot),
+                throttle_duration_sec=5.0,
+            )
 
         if fcu_ok and uwb_ok and pose_ok:
             self._record_origin()
@@ -588,7 +629,13 @@ class TestMissionNode(Node):
         if not uwb_ok:
             self.get_logger().warn("Waiting for UWB...", throttle_duration_sec=5.0)
         if not pose_ok:
-            self.get_logger().warn("Waiting for local pose...", throttle_duration_sec=5.0)
+            if self.mission_mode == "real_full":
+                self.get_logger().warn(
+                    "Waiting for local pose: check optical-flow/rangefinder EKF fusion and EKF origin before real_full.",
+                    throttle_duration_sec=5.0,
+                )
+            else:
+                self.get_logger().warn("Waiting for local pose...", throttle_duration_sec=5.0)
 
     def _tick_arm(self):
         if self._pending_command:
@@ -1091,7 +1138,8 @@ def main(args=None):
     rclpy.init(args=args)
     node = TestMissionNode()
     try:
-        rclpy.spin(node)
+        while rclpy.ok() and not node.should_exit():
+            rclpy.spin_once(node, timeout_sec=0.1)
     except KeyboardInterrupt:
         pass
     finally:

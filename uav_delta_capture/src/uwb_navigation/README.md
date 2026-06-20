@@ -163,9 +163,15 @@ docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic 
 
 ## 桌面 bench_velocity 测试
 
-用途：不上桨叶，验证真实 FCU、MAVROS、ARM、速度 setpoint、DISARM 链路，同时观察 UWB、测距、光流和本地位置是否在线。该模式不会让无人机真实起飞，只会在 ARM 后发送 Z 轴速度曲线。
+用途：不上桨叶，验证真实 FCU、MAVROS、ARM、速度 setpoint、DISARM 链路，同时观察 UWB、测距、光流和本地位置是否在线。该模式不会让无人机真实起飞，只会在 ARM 后发送 Z 轴速度曲线，完成后自动打印 `BENCH RESULT`，并关闭本次 bench launch 启动的辅助节点。
 
-注意：bench 模式不会因为 UWB、测距、光流或 `/mavros/local_position/pose` 暂时没有数据而卡住。节点会在日志中打印 `Bench preflight`，把 FCU、RC、UWB、rangefinder、optical_flow、local_pose、set_mode 服务分别标成 `OK` 或 `WAIT`。其中 FCU 连接、ARM、速度曲线和 DISARM 是核心判据；传感器项是桌面联通性观察项。完整飞行 `real_full` 仍然要求本地位置可用。
+注意：bench 模式不会因为 UWB、测距、光流或 `/mavros/local_position/pose` 暂时没有数据而卡住。节点会在日志中打印 `Bench preflight` 和最终 `Sensor links`，把 FCU、RC、UWB、rangefinder、optical_flow、local_pose、set_mode 服务分别标成 `OK` 或 `WAIT`。其中 FCU 连接、ARM、速度曲线和 DISARM 是核心判据；传感器项是桌面联通性观察项。完整飞行 `real_full` 仍然要求本地位置可用。
+
+结果判读：
+
+- `BENCH RESULT: PASS`：核心链路和观察项都正常。仍需按真实飞行流程做安全检查。
+- `BENCH RESULT: PASS_WITH_WARNINGS`：核心 ARM、速度曲线、DISARM 成功，但至少一个观察项是 `WAIT`。可以认为桌面速度链路通过，但不能直接进入 `real_full`。
+- `BENCH RESULT: FAIL`：核心链路失败，停止后续测试，先看 `Core links`、`Bench warnings` 和 `/tmp/mavros.log`。
 
 默认速度曲线：
 
@@ -185,14 +191,30 @@ docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic 
 - 遥控器已连接飞控，ARM 前油门杆保持最低。
 - 不安装桨叶。
 
-启动 MAVROS：
+推荐每次手动 bench 前先清场：
 
 ```bash
-docker exec -d ros2humble bash -c "
-  source /opt/ros/humble/setup.bash
-  source /workspace/uav_delta_capture/install/setup.bash
-  ros2 launch mavros apm.launch fcu_url:=/dev/ttyACM0:921600 > /tmp/mavros.log 2>&1
-"
+docker restart ros2humble
+```
+
+确认没有任务残余进程。下面命令必须保持单行执行，不要在正则的 `|` 后换行：
+
+```bash
+docker exec ros2humble bash -c "ps -eo pid,ppid,stat,cmd | grep -E 'mavros|test_mission|uwb_aoa|fcu_state|flight_commander|flight_state_machine|fcu_link_monitor|ros2 topic|ros2 launch' | grep -v grep || true"
+```
+
+正常情况下这条命令没有输出。刚重启容器后，`sleep infinity` 是容器 PID 1，不是 ROS 任务残留；如果只看到 `ps -eo ...` 自己，也不是任务残留。看到 `mavros_node`、`test_mission_node.py`、`flight_commander_node` 等才说明还有相关进程。
+
+启动 MAVROS，并请求飞控持续下发本地位置：
+
+```bash
+docker exec -d ros2humble bash -lc "/workspace/uav_delta_capture/scripts/start_mavros_with_local_position.sh > /tmp/start_mavros_with_local_position.log 2>&1"
+```
+
+这个脚本会启动 MAVROS，并调用 `/mavros/set_message_interval` 请求 `LOCAL_POSITION_NED`，也就是 MAVLink `message_id=32`，默认 `10Hz`。如果只需要在已经启动的 MAVROS 上临时恢复本地位置，可以单独执行：
+
+```bash
+docker exec ros2humble bash -lc 'source /opt/ros/humble/setup.bash && ros2 service call /mavros/set_message_interval mavros_msgs/srv/MessageInterval "{message_id: 32, message_rate: 10.0}"'
 ```
 
 确认 MAVROS，并按需要观察本地位置：
@@ -206,6 +228,28 @@ docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic 
 
 # 查看本地位置。bench 不会硬等这条，但 real_full 必须依赖它。
 docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/local_position/pose --once"
+```
+
+可选观察 MAVROS 侧传感器链路：
+
+```bash
+# 测距，当前 MAVROS 转发话题通常是 /mavros/rangefinder_pub
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/rangefinder_pub --once"
+
+# 光流
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/optical_flow/raw/optical_flow --once"
+```
+
+UWB 的 `/uwb_aoa/data` 不是 MAVROS 发布的，而是 `uwb_aoa_driver_node` 发布的。`test_mission_bench.launch.py` 会自动启动这个节点，所以最推荐直接跑 bench，然后看最终 `Sensor links` 里的 `UWB=OK/WAIT`。如果要在 bench 前单独预检 UWB，先临时启动驱动：
+
+```bash
+docker exec -d ros2humble bash -c "source /opt/ros/humble/setup.bash && source /workspace/uav_delta_capture/install/setup.bash && ros2 run uwb_driver uwb_aoa_driver_node --ros-args -p serial_port:=/dev/ttySTM1 -p serial_baud:=115200 > /tmp/uwb_aoa_driver.log 2>&1"
+
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /uwb_aoa/data --once"
+
+docker exec ros2humble bash -c "tail -80 /tmp/uwb_aoa_driver.log"
+
+docker exec ros2humble bash -c "pkill -f [u]wb_aoa_driver_node || true"
 ```
 
 启动 bench：
@@ -234,6 +278,28 @@ docker exec -d ros2humble bash -c "
 docker exec ros2humble bash -c "grep -E 'Bench preflight|BENCH RESULT|Core links|Sensor links|Bench warnings|Phase|bench|Arm|Disarm|PAUSED|FAILSAFE|ERROR|WARN' /tmp/mission_bench.log | tail -120"
 ```
 
+一次完整手动测试顺序：
+
+```bash
+# 1. 清场
+docker restart ros2humble
+
+# 2. 验证无残余任务进程。正常应无输出。
+docker exec ros2humble bash -c "ps -eo pid,ppid,stat,cmd | grep -E 'mavros|test_mission|uwb_aoa|fcu_state|flight_commander|flight_state_machine|fcu_link_monitor|ros2 topic|ros2 launch' | grep -v grep || true"
+
+# 3. 启动 MAVROS
+docker exec -d ros2humble bash -c "source /opt/ros/humble/setup.bash && source /workspace/uav_delta_capture/install/setup.bash && ros2 launch mavros apm.launch fcu_url:=/dev/ttyACM0:921600 > /tmp/mavros.log 2>&1"
+
+# 4. 等 10 秒左右后确认飞控已连接
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/state --once"
+
+# 5. 可选：检查 MAVROS 侧光流。看到 quality > 0 表示 MAVROS 收到光流消息。
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/optical_flow/raw/optical_flow --once"
+
+# 6. 启动 bench，等待它自动打印 BENCH RESULT 并退出。UWB 驱动会由这个 launch 自动启动并随 launch 关闭。
+docker exec -it ros2humble bash -c "source /opt/ros/humble/setup.bash && source /workspace/uav_delta_capture/install/setup.bash && ros2 launch uwb_navigation test_mission_bench.launch.py"
+```
+
 监测速度链路：
 
 ```bash
@@ -247,6 +313,28 @@ docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic 
 ## real_full 完整任务
 
 用途：执行完整任务状态机。该模式有真实起飞、移动、下降、返航和降落动作，只能在去桨检查、传感器检查、遥控接管验证、场地安全确认之后分阶段测试。
+
+当前硬门槛：`real_full` 必须等到 `/mavros/local_position/pose` 有连续数据才会继续。不要把 `require_local_pose_ready` 改成 `false` 绕过这条保护；没有本地位置时，GUIDED 速度控制和返航都不可靠。
+
+室内真实导航依赖飞控用光流和测距融合出本地位置。bench 中 `UWB=OK rangefinder=OK optical_flow=OK local_pose=WAIT` 的含义是：传感器和上位机链路已经通了，但飞控 EKF 还没有给 MAVROS 输出可用本地位置。
+
+飞控侧检查顺序：
+
+1. 用 Mission Planner 或等价地面站备份当前参数。
+2. 确认光流、测距模块方向和安装方向正确，光流朝下，测距朝下。
+3. 按 ArduPilot 光流/测距室内定位方案检查 EKF3 source 参数：
+
+```text
+EK3_SRC1_POSXY = 0
+EK3_SRC1_VELXY = 5
+EK3_SRC1_POSZ  = 1
+EK3_SRC1_VELZ  = 0
+EK3_SRC1_YAW   = 1
+EK3_SRC_OPTIONS = 0
+```
+
+4. 室内无 GPS 时，用地面站设置 EKF Origin。Mission Planner 可在地图上右键设置 EKF origin。
+5. 重新启动 MAVROS 后，确认 `/mavros/local_position/pose` 连续输出，再进入真实任务。
 
 启动前必须确认：
 
@@ -264,6 +352,23 @@ docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic 
 docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/state --once"
 ```
 
+定位链路专项检查：
+
+```bash
+# 光流。quality > 0 说明 MAVROS 收到光流消息。
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/optical_flow/raw/optical_flow --once"
+
+# 测距。range 应在 min/max 之间，并随高度变化。
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/rangefinder_pub --once"
+
+# EKF 状态。至少要有姿态、水平速度、垂直速度估计。
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/estimator_status --once"
+
+# 本地位置。real_full 前必须连续输出。
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 10 ros2 topic hz /mavros/local_position/pose"
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/local_position/pose --once"
+```
+
 启动完整任务：
 
 ```bash
@@ -273,6 +378,20 @@ docker exec -it ros2humble bash -c "
   ros2 launch uwb_navigation test_mission_real_full.launch.py
 "
 ```
+
+`real_full` 启动后会打印 `Real preflight`，其中：
+
+- `UWB=OK`、`rangefinder=OK`、`optical_flow=OK` 表示上位机能看到对应链路。
+- `local_pose=WAIT` 表示飞控还没有输出本地位置，任务会继续等待，不会进入 ARM。
+- `estimator=WAIT` 或 `vel_h/vel_v=WAIT` 表示 EKF 估计还不满足，先回到飞控参数和 EKF origin 排查。
+
+分阶段真实飞行建议：
+
+1. 去桨 bench 保持 `PASS` 或只剩 `local_pose=WAIT` 这类已知 warning。
+2. 解决 `/mavros/local_position/pose` 后，再跑一次 bench，目标是 `local_pose=OK`。
+3. 上桨后先手动 `ALT_HOLD/LOITER` 短悬停，验证高度、光流、测距稳定。
+4. 再验证 GUIDED 小速度 setpoint，观察 `/mavros/rc/out` 和机体响应。
+5. 最后低高度、短距离跑 `real_full`，先保留 `fake_grasp=true`、`fake_drop=true`。
 
 后台运行并保存日志：
 
@@ -368,8 +487,10 @@ docker exec ros2humble bash -c "
 查看残留：
 
 ```bash
-docker exec ros2humble bash -c "ps -eo pid,ppid,cmd | grep -E 'mavros|test_mission|uwb_aoa|fcu_state|flight_commander|flight_state_machine|fcu_link_monitor|ros2 launch' | grep -v grep || true"
+docker exec ros2humble bash -c "ps -eo pid,ppid,stat,cmd | grep -E 'mavros|test_mission|uwb_aoa|fcu_state|flight_commander|flight_state_machine|fcu_link_monitor|ros2 topic|ros2 launch' | grep -v grep || true"
 ```
+
+这条命令要保持单行。正常无输出；`sleep infinity` 是容器 PID 1，不代表任务残留；`ros2-daemon` 也不控制飞控。
 
 卡死时强制清理：
 

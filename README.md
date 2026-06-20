@@ -39,7 +39,7 @@ uav_delta_capture/src/
 当前自主任务主线。核心节点是 Python 版本的 `test_mission_node.py`，负责三种运行模式：
 
 - `mock_full`：纯软件 mock，全流程状态机连通性测试。
-- `bench_velocity`：桌面级去桨验证，FCU 连接是硬条件，UWB 和本地位置只做在线状态监测；ARM 后发送短时间 Z 轴速度曲线，再 DISARM。
+- `bench_velocity`：桌面级去桨验证，FCU 连接是硬条件，UWB、测距、光流和本地位置只做在线状态监测；ARM 后发送 Z 轴速度曲线，再 DISARM，并在日志中输出结果摘要。
 - `real_full`：完整自主任务流程，抓取和投放可以先用假信号或计时器占位。
 
 具体运行命令、话题监测、状态机说明见 `uav_delta_capture/src/uwb_navigation/README.md`。

@@ -4,11 +4,22 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import EmitEvent, RegisterEventHandler
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
 from launch_ros.actions import Node
 
 
 def generate_launch_description():
     share_dir = get_package_share_directory('uwb_navigation')
+
+    test_mission_node = Node(
+        package='uwb_navigation',
+        executable='test_mission_node.py',
+        name='test_mission_node',
+        parameters=[os.path.join(share_dir, 'test_mission_bench.yaml')],
+        output='screen',
+    )
 
     return LaunchDescription([
         Node(
@@ -38,11 +49,15 @@ def generate_launch_description():
             name='uwb_aoa_driver_node',
             parameters=[{'serial_port': '/dev/ttySTM1', 'serial_baud': 115200}],
         ),
-        Node(
-            package='uwb_navigation',
-            executable='test_mission_node.py',
-            name='test_mission_node',
-            parameters=[os.path.join(share_dir, 'test_mission_bench.yaml')],
-            output='screen',
+        test_mission_node,
+        RegisterEventHandler(
+            OnProcessExit(
+                target_action=test_mission_node,
+                on_exit=[
+                    EmitEvent(
+                        event=Shutdown(reason='bench test_mission_node completed')
+                    )
+                ],
+            )
         ),
     ])
