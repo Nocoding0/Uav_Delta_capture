@@ -208,6 +208,10 @@ class TestMissionNode(Node):
         self._bench_disarm_ok = False
         self._bench_guided_ok = None
         self._bench_result_reported = False
+        self._takeoff_land_takeoff_ok = False
+        self._takeoff_land_hover_ok = False
+        self._takeoff_land_land_ok = False
+        self._takeoff_land_result_reported = False
         self._shutdown_requested = False
 
         cb_group = ReentrantCallbackGroup()
@@ -595,6 +599,48 @@ class TestMissionNode(Node):
         if self.mission_mode == "bench_velocity" and self.bench_exit_on_complete:
             self._shutdown_requested = True
 
+    def _report_takeoff_land_result(self, force_fail_reason=None):
+        if self._takeoff_land_result_reported:
+            return
+        self._takeoff_land_result_reported = True
+
+        snapshot = self._bench_snapshot()
+        core_ok = (
+            self._bench_arm_ok
+            and self._takeoff_land_takeoff_ok
+            and self._takeoff_land_hover_ok
+            and self._takeoff_land_land_ok
+        )
+        sensor_ok = (
+            snapshot["fcu_ok"]
+            and snapshot["rc_ok"]
+            and snapshot["pose_ok"]
+            and snapshot["range_ok"]
+            and snapshot["flow_ok"]
+            and snapshot["set_mode_ok"]
+        )
+        warnings = []
+        if not sensor_ok:
+            warnings.append("required sensor link not OK")
+        if force_fail_reason:
+            warnings.append(force_fail_reason)
+
+        result = "PASS" if core_ok and sensor_ok and not force_fail_reason else "FAIL"
+        self.get_logger().info("========== TAKEOFF_LAND RESULT ==========")
+        self.get_logger().info(f"TAKEOFF_LAND RESULT: {result}")
+        self.get_logger().info(
+            "Core links: "
+            f"ARM={'OK' if self._bench_arm_ok else 'FAIL'} "
+            f"TAKEOFF={'OK' if self._takeoff_land_takeoff_ok else 'FAIL'} "
+            f"HOVER={'OK' if self._takeoff_land_hover_ok else 'FAIL'} "
+            f"LAND={'OK' if self._takeoff_land_land_ok else 'FAIL'}"
+        )
+        self.get_logger().info(f"Sensor links: {self._format_bench_snapshot(snapshot)}")
+        if warnings:
+            self.get_logger().warn("Takeoff-land warnings: " + "; ".join(warnings))
+        self.get_logger().info("=========================================")
+        self._shutdown_requested = True
+
     def should_exit(self):
         return self._shutdown_requested
 
@@ -611,6 +657,30 @@ class TestMissionNode(Node):
                 "Bench preflight: " + self._format_bench_snapshot(snapshot),
                 throttle_duration_sec=5.0,
             )
+        elif self.mission_mode == "takeoff_hover_land":
+            snapshot = self._bench_snapshot()
+            required_ok = (
+                snapshot["fcu_ok"]
+                and snapshot["rc_ok"]
+                and snapshot["pose_ok"]
+                and snapshot["range_ok"]
+                and snapshot["flow_ok"]
+                and snapshot["set_mode_ok"]
+            )
+            self.get_logger().info(
+                "Takeoff-land preflight: " + self._format_bench_snapshot(snapshot),
+                throttle_duration_sec=5.0,
+            )
+            if not required_ok:
+                if not snapshot["rc_ok"]:
+                    self.get_logger().warn("Waiting for RC/manual_input...", throttle_duration_sec=5.0)
+                if not snapshot["range_ok"]:
+                    self.get_logger().warn("Waiting for rangefinder...", throttle_duration_sec=5.0)
+                if not snapshot["flow_ok"]:
+                    self.get_logger().warn("Waiting for optical_flow...", throttle_duration_sec=5.0)
+                if not snapshot["set_mode_ok"]:
+                    self.get_logger().warn("Waiting for MAVROS set_mode service...", throttle_duration_sec=5.0)
+                return
         elif self.mission_mode == "real_full":
             snapshot = self._bench_snapshot()
             self.get_logger().info(
@@ -670,7 +740,7 @@ class TestMissionNode(Node):
         self.get_logger().info(f"Arm OK: {msg}")
         self._publish_event("armed")
         self._command_retry_count = 0
-        if self.mission_mode == "bench_velocity":
+        if self.mission_mode in ("bench_velocity", "takeoff_hover_land"):
             self._bench_arm_ok = True
 
         if self.mission_mode == "bench_velocity":
@@ -741,10 +811,13 @@ class TestMissionNode(Node):
         self._pending_command = False
         if success:
             self.get_logger().info(f"Takeoff OK: {msg}")
+            self._takeoff_land_takeoff_ok = True
             self._publish_event("takeoff_accepted")
             self._transition(Phase.HOVER_TAKEOFF)
         else:
             self.get_logger().error(f"Takeoff FAILED: {msg}")
+            if self.mission_mode == "takeoff_hover_land":
+                self._report_takeoff_land_result("TAKEOFF failed")
             self._transition(Phase.FAILSAFE)
 
     def _tick_hover_takeoff(self):
@@ -757,6 +830,15 @@ class TestMissionNode(Node):
 
         alt = self._get_fcu_altitude()
         if abs(alt - self.takeoff_altitude) <= self.altitude_tolerance:
+            if self.mission_mode == "takeoff_hover_land":
+                self._check_stable_and_transition(
+                    Phase.LAND,
+                    f"Takeoff-land hover stable at {alt:.2f}m",
+                    "takeoff_land_hover_stable",
+                )
+                if self.phase == Phase.LAND:
+                    self._takeoff_land_hover_ok = True
+                return
             self._check_stable_and_transition(
                 Phase.MOVE_ABOVE, f"Takeoff altitude stable at {alt:.2f}m", "hover_takeoff_stable"
             )
@@ -972,12 +1054,18 @@ class TestMissionNode(Node):
         if success:
             self.get_logger().info(f"Land OK: {msg}")
             self._publish_event("landing")
+            if self.mission_mode == "takeoff_hover_land":
+                self._takeoff_land_land_ok = True
             self._transition(Phase.DONE)
             reset_msg = String()
             reset_msg.data = "RESET"
             self.flight_reset_pub.publish(reset_msg)
+            if self.mission_mode == "takeoff_hover_land":
+                self._report_takeoff_land_result()
         else:
             self.get_logger().error(f"Land FAILED: {msg}, retrying")
+            if self.mission_mode == "takeoff_hover_land":
+                self._report_takeoff_land_result("LAND failed")
 
     def _tick_done(self):
         self._publish_velocity(0.0, 0.0, 0.0)

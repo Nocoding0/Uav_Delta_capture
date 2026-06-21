@@ -169,9 +169,19 @@ docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic 
 
 结果判读：
 
-- `BENCH RESULT: PASS`：核心链路和观察项都正常。仍需按真实飞行流程做安全检查。
-- `BENCH RESULT: PASS_WITH_WARNINGS`：核心 ARM、速度曲线、DISARM 成功，但至少一个观察项是 `WAIT`。可以认为桌面速度链路通过，但不能直接进入 `real_full`。
+- `BENCH RESULT: PASS`：核心 ARM、速度曲线、DISARM 和全部观察项都正常。可以进入下一阶段的去桨真实任务预检。
+- `BENCH RESULT: PASS_WITH_WARNINGS`：核心 ARM、速度曲线、DISARM 成功，但至少一个观察项是 `WAIT`。只说明桌面速度链路通过，不能直接进入 `real_full`。
 - `BENCH RESULT: FAIL`：核心链路失败，停止后续测试，先看 `Core links`、`Bench warnings` 和 `/tmp/mavros.log`。
+
+当前通过标准示例：
+
+```text
+BENCH RESULT: PASS
+Core links: ARM=OK velocity_profile=OK DISARM=OK
+Sensor links: FCU=OK mode=GUIDED armed=false RC=OK UWB=OK rangefinder=OK optical_flow=OK local_pose=OK set_mode_srv=OK
+```
+
+看到这个结果后，可以认为 FCU、遥控器、MAVROS 本地位置、UWB、测距、光流、模式服务、ARM/速度/DISARM 链路已经完成去桨 bench 验证。
 
 默认速度曲线：
 
@@ -227,7 +237,8 @@ docker exec ros2humble bash -c "grep -E 'HEARTBEAT|connected' /tmp/mavros.log | 
 docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/state --once"
 
 # 查看本地位置。bench 不会硬等这条，但 real_full 必须依赖它。
-docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/local_position/pose --once"
+# 该话题是 BEST_EFFORT QoS，echo 时显式指定 best_effort 更稳定。
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/local_position/pose --qos-reliability best_effort --once"
 ```
 
 可选观察 MAVROS 侧传感器链路：
@@ -287,8 +298,8 @@ docker restart ros2humble
 # 2. 验证无残余任务进程。正常应无输出。
 docker exec ros2humble bash -c "ps -eo pid,ppid,stat,cmd | grep -E 'mavros|test_mission|uwb_aoa|fcu_state|flight_commander|flight_state_machine|fcu_link_monitor|ros2 topic|ros2 launch' | grep -v grep || true"
 
-# 3. 启动 MAVROS
-docker exec -d ros2humble bash -c "source /opt/ros/humble/setup.bash && source /workspace/uav_delta_capture/install/setup.bash && ros2 launch mavros apm.launch fcu_url:=/dev/ttyACM0:921600 > /tmp/mavros.log 2>&1"
+# 3. 启动 MAVROS，并自动请求本地位置
+docker exec -d ros2humble bash -lc "/workspace/uav_delta_capture/scripts/start_mavros_with_local_position.sh > /tmp/start_mavros_with_local_position.log 2>&1"
 
 # 4. 等 10 秒左右后确认飞控已连接
 docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/state --once"
@@ -310,7 +321,137 @@ docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic 
 docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/setpoint_velocity/cmd_vel"
 ```
 
-## real_full 完整任务
+## bench PASS 后的下一步
+
+bench 已经 `PASS` 后，不要直接上来就跑完整任务。按下面顺序推进，每一步只验证一个风险点。
+
+### 1. 去桨静态复核
+
+```bash
+# 清场
+docker restart ros2humble
+
+# 启动 MAVROS，并自动请求 /mavros/local_position/pose
+docker exec -d ros2humble bash -lc "/workspace/uav_delta_capture/scripts/start_mavros_with_local_position.sh > /tmp/start_mavros_with_local_position.log 2>&1"
+
+# 确认 MAVROS 连接
+docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/state --once"
+
+# 确认本地位置 10Hz 左右
+docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && timeout 10 ros2 topic hz /mavros/local_position/pose"
+
+# 确认 UWB 有数据
+docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && source /workspace/uav_delta_capture/install/setup.bash && timeout 5 ros2 topic echo /uwb_aoa/data --once"
+
+# 确认测距和光流
+docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/rangefinder_pub --once"
+docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/optical_flow/raw/optical_flow --once"
+```
+
+### 2. 去桨 real_full 预跑
+
+用途：验证完整状态机、话题、服务和日志，不验证真实升力。保持去桨、低风险环境、遥控器可随时接管。
+
+```bash
+docker exec -it ros2humble bash -lc "
+  source /opt/ros/humble/setup.bash
+  source /workspace/uav_delta_capture/install/setup.bash
+  ros2 launch uwb_navigation test_mission_real_full.launch.py
+"
+```
+
+后台保存日志：
+
+```bash
+docker exec -d ros2humble bash -lc "
+  source /opt/ros/humble/setup.bash
+  source /workspace/uav_delta_capture/install/setup.bash
+  ros2 launch uwb_navigation test_mission_real_full.launch.py > /tmp/mission_real_full.log 2>&1
+"
+
+# 观察关键日志
+docker exec ros2humble bash -lc "grep -E 'Real preflight|Phase|UWB|local_pose|rangefinder|optical_flow|ARM|GUIDED|LAND|DONE|FAILSAFE|ERROR|WARN' /tmp/mission_real_full.log | tail -160"
+```
+
+### 3. 上桨前安全检查和手动短悬停
+
+用途：确认装桨后的电机方向、桨叶方向、姿态控制、高度控制和遥控接管都正常。不要把第一次装桨测试直接交给自主脚本。
+
+必须满足：
+
+- bench 已经 `PASS`，并且 `Sensor links` 里 `local_pose=OK`、`rangefinder=OK`、`optical_flow=OK`。
+- 飞控当前 `armed=false`。如果刚跑过 bench，模式可能停在 `GUIDED`，先用遥控器或地面站切回 `ALT_HOLD` 或 `LOITER`。
+- 油门杆保持最低。若日志出现 `Arm: Throttle (RC3) is not neutral`，先把油门杆打到最低；如果仍失败，再检查 RC3 校准、通道反向和遥控器油门曲线。
+- 遥控器可随时切出 `GUIDED`，并且现场已确认急停/上锁动作。
+- 场地清空，电池固定，机架、桨叶和旋向检查完成。
+
+上桨后先手动短悬停：
+
+1. 手动切到 `ALT_HOLD` 或 `LOITER`。
+2. 手动解锁，缓慢起飞到 `0.3m` 到 `0.5m`。
+3. 悬停几秒，确认没有明显漂移、翻转趋势或高度异常。
+4. 手动降落并上锁。
+5. 手动短悬停正常后，再进入下一节的自主起降脚本。
+
+### 4. 第一次上桨自主起降测试
+
+用途：只验证自动 ARM、低高度起飞、短悬停、自动 LAND，不验证 UWB 接近、抓取、返航。首次默认起飞高度 `0.6m`，悬停 `5s`。该 launch 会在 `test_mission_node` 结束后自动 shutdown 辅助节点；上桨测试不跳过 EKF 检查。
+
+前置条件：bench 已经 `PASS`，并且手动短悬停正常。遥控器全程准备切出 GUIDED 或接管。
+
+```bash
+# 清场
+docker restart ros2humble
+
+# 启动 MAVROS，并自动恢复 /mavros/local_position/pose
+docker exec -d ros2humble bash -lc "/workspace/uav_delta_capture/scripts/start_mavros_with_local_position.sh > /tmp/start_mavros_with_local_position.log 2>&1"
+
+# 确认飞控已连接、未解锁。上桨测试前建议先让模式回到 ALT_HOLD 或 LOITER。
+docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/state --once"
+
+# 确认本地位置、测距、光流。本地位置话题使用 BEST_EFFORT QoS。
+docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && timeout 10 ros2 topic hz /mavros/local_position/pose"
+docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/local_position/pose --qos-reliability best_effort --once"
+docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/rangefinder_pub --once"
+docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/optical_flow/raw/optical_flow --once"
+
+# 前台运行，方便随时 Ctrl+C 看日志
+docker exec -it ros2humble bash -lc "
+  source /opt/ros/humble/setup.bash
+  source /workspace/uav_delta_capture/install/setup.bash
+  ros2 launch uwb_navigation test_mission_takeoff_land.launch.py
+"
+```
+
+后台保存日志：
+
+```bash
+docker exec -d ros2humble bash -lc "
+  source /opt/ros/humble/setup.bash
+  source /workspace/uav_delta_capture/install/setup.bash
+  ros2 launch uwb_navigation test_mission_takeoff_land.launch.py > /tmp/mission_takeoff_land.log 2>&1
+"
+
+docker exec ros2humble bash -lc "grep -E 'Takeoff-land preflight|TAKEOFF_LAND RESULT|Core links|Sensor links|Phase|Takeoff|Land|FAILSAFE|ERROR|WARN' /tmp/mission_takeoff_land.log | tail -160"
+```
+
+通过标准：
+
+```text
+TAKEOFF_LAND RESULT: PASS
+Core links: ARM=OK TAKEOFF=OK HOVER=OK LAND=OK
+Sensor links: FCU=OK ... RC=OK ... rangefinder=OK ... optical_flow=OK local_pose=OK set_mode_srv=OK
+```
+
+通过后再进入小范围 GUIDED 速度闭环测试，最后才跑低高度短距离 `real_full`。
+
+如果失败：
+
+- `Arm: Throttle (RC3) is not neutral`：油门杆没有在飞控认可的最低/中立位置，先调整油门杆，再查 RC3 校准。
+- `local_pose=WAIT`：不要上桨继续测，先回到 MAVROS 本地位置和 EKF origin 排查。
+- `rangefinder=WAIT` 或 `optical_flow=WAIT`：不要跑自主起降，先确认测距、光流供电、安装方向和 MAVROS 话题。
+
+### 5. 低高度短距离 real_full
 
 用途：执行完整任务状态机。该模式有真实起飞、移动、下降、返航和降落动作，只能在去桨检查、传感器检查、遥控接管验证、场地安全确认之后分阶段测试。
 
@@ -346,7 +487,7 @@ docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic 
 docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /fcu_state --once"
 
 # 本地位置正常
-docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/local_position/pose --once"
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/local_position/pose --qos-reliability best_effort --once"
 
 # 遥控器能切出 GUIDED 并接管
 docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/state --once"
@@ -366,7 +507,7 @@ docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 5 r
 
 # 本地位置。real_full 前必须连续输出。
 docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 10 ros2 topic hz /mavros/local_position/pose"
-docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/local_position/pose --once"
+docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/local_position/pose --qos-reliability best_effort --once"
 ```
 
 启动完整任务：
