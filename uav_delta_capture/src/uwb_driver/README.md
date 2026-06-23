@@ -19,7 +19,7 @@ UWB 数据采集主节点。
 - `uwb_aoa/data`（`UavDeltaMsgs/UwbAoa`）- 滤波后的 UWB 数据
 
 **参数：**
-- `serial_port`（string）- 串口路径，代码默认 `/dev/ttyACM1`，当前实机建议显式设为 `/dev/ttySTM1`
+- `serial_port`（string）- 串口路径，代码默认 `/dev/ttySTM1`
 - `serial_baud`（int）- 波特率，默认 `115200`
 - `uwb_aoa_topic`（string）- 输出话题，默认 `uwb_aoa/data`
 - `signal_loss_timeout_sec`（double）- 信号超时阈值，默认 `0.2`

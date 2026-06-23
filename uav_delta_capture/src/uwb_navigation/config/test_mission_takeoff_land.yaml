@@ -42,8 +42,10 @@ test_mission_node:
     # Unused by this mode, kept for shared node parameters.
     fake_grasp: true
     fake_grasp_delay_sec: 10.0
+    grasp_timeout_sec: 15.0
     fake_drop: true
     fake_drop_delay_sec: 2.0
+    drop_timeout_sec: 10.0
     grasp_done_topic: grasp_done
     drop_done_topic: drop_done
     kp_horizontal: 0.4

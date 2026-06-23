@@ -109,8 +109,10 @@ class TestMissionNode(Node):
 
         self.fake_grasp = self.declare_parameter("fake_grasp", True).value
         self.fake_grasp_delay_sec = self.declare_parameter("fake_grasp_delay_sec", 10.0).value
+        self.grasp_timeout_sec = self.declare_parameter("grasp_timeout_sec", 15.0).value
         self.fake_drop = self.declare_parameter("fake_drop", True).value
         self.fake_drop_delay_sec = self.declare_parameter("fake_drop_delay_sec", 2.0).value
+        self.drop_timeout_sec = self.declare_parameter("drop_timeout_sec", 10.0).value
         self.grasp_done_topic = self.declare_parameter("grasp_done_topic", "grasp_done").value
         self.drop_done_topic = self.declare_parameter("drop_done_topic", "drop_done").value
 
@@ -162,6 +164,8 @@ class TestMissionNode(Node):
         self.max_vel_z = max(0.05, self.max_vel_z)
         self.velocity_slew_rate = max(0.01, self.velocity_slew_rate)
         self.bench_velocity_z = clamp(abs(self.bench_velocity_z), 0.02, self.max_vel_z)
+        self.grasp_timeout_sec = max(0.1, float(self.grasp_timeout_sec))
+        self.drop_timeout_sec = max(0.1, float(self.drop_timeout_sec))
 
         self.phase = Phase.INIT
         self.previous_flight_phase = Phase.INIT
@@ -180,6 +184,8 @@ class TestMissionNode(Node):
         self._last_velocity = (0.0, 0.0, 0.0)
         self._last_velocity_time = self.get_clock().now()
         self._recovery_start_time = None
+        self._last_preflight_event = ""
+        self._last_preflight_event_time = self.get_clock().now()
 
         self._data_lock = threading.Lock()
         self._last_uwb = None
@@ -672,8 +678,13 @@ class TestMissionNode(Node):
                 throttle_duration_sec=5.0,
             )
             if not required_ok:
+                wait_event = self._takeoff_land_preflight_wait_event(snapshot)
+                if wait_event:
+                    self._publish_preflight_event(wait_event)
                 if not snapshot["rc_ok"]:
                     self.get_logger().warn("Waiting for RC/manual_input...", throttle_duration_sec=5.0)
+                if not snapshot["pose_ok"]:
+                    self.get_logger().warn("Waiting for local pose...", throttle_duration_sec=5.0)
                 if not snapshot["range_ok"]:
                     self.get_logger().warn("Waiting for rangefinder...", throttle_duration_sec=5.0)
                 if not snapshot["flow_ok"]:
@@ -689,10 +700,15 @@ class TestMissionNode(Node):
             )
 
         if fcu_ok and uwb_ok and pose_ok:
+            self._publish_preflight_event("preflight_ready")
             self._record_origin()
             self.get_logger().info("Preflight links ready, starting mission")
             self._transition(Phase.ARM)
             return
+
+        wait_event = self._core_preflight_wait_event(fcu_ok, uwb_ok, pose_ok)
+        if wait_event:
+            self._publish_preflight_event(wait_event)
 
         if not fcu_ok:
             self.get_logger().warn("Waiting for FCU...", throttle_duration_sec=5.0)
@@ -953,6 +969,20 @@ class TestMissionNode(Node):
             self._transition(Phase.CLIMB)
             return
 
+        if self.grasp_start_time is None:
+            self.grasp_start_time = self.get_clock().now()
+            self.get_logger().info(
+                f"Waiting for grasp_done signal (timeout={self.grasp_timeout_sec:.1f}s)"
+            )
+
+        elapsed = (self.get_clock().now() - self.grasp_start_time).nanoseconds / 1e9
+        if elapsed >= self.grasp_timeout_sec:
+            self.get_logger().error(f"grasp_done timeout after {elapsed:.1f}s, entering FAILSAFE")
+            self._publish_event("grasp_timeout")
+            self._publish_velocity(0.0, 0.0, 0.0)
+            self._transition(Phase.FAILSAFE)
+            return
+
         self.get_logger().info("Waiting for grasp_done signal...", throttle_duration_sec=2.0)
 
     def _tick_climb(self):
@@ -1038,6 +1068,20 @@ class TestMissionNode(Node):
         if self._drop_done:
             self._publish_event("drop_complete")
             self._transition(Phase.LAND)
+            return
+
+        if self.drop_start_time is None:
+            self.drop_start_time = self.get_clock().now()
+            self.get_logger().info(
+                f"Waiting for drop_done signal (timeout={self.drop_timeout_sec:.1f}s)"
+            )
+
+        elapsed = (self.get_clock().now() - self.drop_start_time).nanoseconds / 1e9
+        if elapsed >= self.drop_timeout_sec:
+            self.get_logger().error(f"drop_done timeout after {elapsed:.1f}s, entering FAILSAFE")
+            self._publish_event("drop_timeout")
+            self._publish_velocity(0.0, 0.0, 0.0)
+            self._transition(Phase.FAILSAFE)
             return
 
         self.get_logger().info("Waiting for drop_done signal...", throttle_duration_sec=2.0)
@@ -1172,6 +1216,39 @@ class TestMissionNode(Node):
         msg = String()
         msg.data = event
         self.event_pub.publish(msg)
+
+    def _publish_preflight_event(self, event: str):
+        now = self.get_clock().now()
+        elapsed = (now - self._last_preflight_event_time).nanoseconds / 1e9
+        if event == self._last_preflight_event and elapsed < 5.0:
+            return
+        self._last_preflight_event = event
+        self._last_preflight_event_time = now
+        self._publish_event(event)
+
+    def _core_preflight_wait_event(self, fcu_ok: bool, uwb_ok: bool, pose_ok: bool):
+        if not fcu_ok:
+            return "preflight_wait:fcu"
+        if not uwb_ok:
+            return "preflight_wait:uwb"
+        if not pose_ok:
+            return "preflight_wait:local_pose"
+        return None
+
+    def _takeoff_land_preflight_wait_event(self, snapshot):
+        if not snapshot["fcu_ok"]:
+            return "preflight_wait:fcu"
+        if not snapshot["rc_ok"]:
+            return "preflight_wait:rc_manual_input"
+        if not snapshot["pose_ok"]:
+            return "preflight_wait:local_pose"
+        if not snapshot["range_ok"]:
+            return "preflight_wait:rangefinder"
+        if not snapshot["flow_ok"]:
+            return "preflight_wait:optical_flow"
+        if not snapshot["set_mode_ok"]:
+            return "preflight_wait:set_mode_service"
+        return None
 
     def _call_flight_cmd(self, command: int, param: float, callback):
         if not self.flight_cmd_client.wait_for_service(timeout_sec=1.0):

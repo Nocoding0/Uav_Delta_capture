@@ -669,7 +669,7 @@ docker restart ros2humble
 
 | 参数 | 说明 |
 |---|---|
-| `mission_mode` | `mock_full`、`bench_velocity` 或 `real_full` |
+| `mission_mode` | `mock_full`、`bench_velocity`、`takeoff_hover_land` 或 `real_full` |
 | `require_uwb_ready` | `INIT` 阶段是否等待 UWB 数据有效 |
 | `require_local_pose_ready` | `INIT` 阶段是否等待本地位置有效 |
 | `takeoff_altitude` | 起飞和返航阶段使用的固定高度 |
@@ -682,6 +682,7 @@ docker restart ros2humble
 | `bench_sensor_timeout` | bench 自检判断传感器消息是否新鲜的超时时间 |
 | `auto_modes` | 允许自主任务继续运行的飞控模式列表 |
 | `fake_grasp` / `fake_drop` | 是否用计时器代替真实抓取/投放完成信号 |
+| `grasp_timeout_sec` / `drop_timeout_sec` | `fake_grasp=false` 或 `fake_drop=false` 时等待外部完成信号的超时时间，超时进入 `FAILSAFE` |
 
 ## 常见问题
 

@@ -102,14 +102,14 @@ ros2 launch vision_test vision_test.launch.py
 ros2 launch vision_test vision_test.launch.py use_npu:=true num_iterations:=50
 ```
 
-### 方式 3：独立脚本测试（不依赖 ROS 2）
+### 方式 3：归档独立脚本测试（不依赖 ROS 2）
 
 ```bash
 # NPU benchmark（stai_mpu）
-python3 /usr/local/Uav_Delta_capture/bench_npu.py
+python3 /usr/local/Uav_Delta_capture/archive_legacy/bench_npu.py
 
 # CPU benchmark（onnxruntime）
-python3 /usr/local/Uav_Delta_capture/bench_standalone.py
+python3 /usr/local/Uav_Delta_capture/archive_legacy/bench_standalone.py
 ```
 
 ## 参数说明
