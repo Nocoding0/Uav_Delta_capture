@@ -8,7 +8,6 @@
 
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <mavros_msgs/srv/command_bool.hpp>
-#include <mavros_msgs/srv/command_long.hpp>
 #include <mavros_msgs/srv/command_tol.hpp>
 #include <mavros_msgs/srv/set_mode.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -31,6 +30,7 @@ public:
     mavros_set_mode_topic_(declare_parameter<std::string>("mavros_set_mode_topic", "/mavros/set_mode")),
     mavros_vel_topic_(declare_parameter<std::string>("mavros_vel_topic", "/mavros/setpoint_velocity/cmd_vel")),
     mavros_takeoff_topic_(declare_parameter<std::string>("mavros_takeoff_topic", "/mavros/cmd/takeoff")),
+    takeoff_target_clearance_m_(declare_parameter<double>("takeoff_target_clearance_m", 0.2)),
     vel_forward_rate_hz_(declare_parameter<double>("vel_forward_rate_hz", 20.0)),
     vel_timeout_sec_(declare_parameter<double>("vel_timeout_sec", 0.5)),
     use_mock_(declare_parameter<bool>("use_mock", false)),
@@ -42,6 +42,7 @@ public:
     vel_timeout_sec_ = std::max(0.05, vel_timeout_sec_);
     max_vel_xy_ = std::max(0.1, max_vel_xy_);
     max_vel_z_ = std::max(0.1, max_vel_z_);
+    takeoff_target_clearance_m_ = std::max(0.05, takeoff_target_clearance_m_);
     last_vel_time_ = now();
 
     // Use a reentrant callback group so async service calls from within
@@ -268,6 +269,15 @@ private:
       altitude = 1.0f;  // default 1m
     }
 
+    float target_altitude = altitude;
+    float current_local_z = 0.0f;
+    if (has_state_ && last_state_) {
+      current_local_z = std::max(0.0f, last_state_->local_z);
+      target_altitude = std::max(
+        target_altitude,
+        current_local_z + static_cast<float>(takeoff_target_clearance_m_));
+    }
+
     // Switch to GUIDED mode (fire-and-forget, don't block)
     if (set_mode_client_->service_is_ready()) {
       auto mode_req = std::make_shared<mavros_msgs::srv::SetMode::Request>();
@@ -289,22 +299,25 @@ private:
     req->yaw = 0.0f;
     req->latitude = 0.0;
     req->longitude = 0.0;
-    req->altitude = altitude;
+    req->altitude = target_altitude;
 
     std::mutex mtx;
     std::condition_variable cv;
     bool done = false;
 
     takeoff_client_->async_send_request(req,
-      [this, altitude, response, &mtx, &cv, &done](
+      [this, altitude, target_altitude, current_local_z, response, &mtx, &cv, &done](
         rclcpp::Client<mavros_msgs::srv::CommandTOL>::SharedFuture future)
       {
         auto result = future.get();
         response->success = result->success;
         response->message = result->success
-          ? ("takeoff to " + std::to_string(altitude) + "m accepted")
+          ? ("takeoff to " + std::to_string(altitude) + "m accepted (service_target=" +
+            std::to_string(target_altitude) + "m)")
           : "takeoff command rejected by FCU";
-        RCLCPP_INFO(get_logger(), "Takeoff(%.1fm) result: %s", altitude, response->message.c_str());
+        RCLCPP_INFO(
+          get_logger(), "Takeoff(request=%.1fm service_target=%.2fm current_local_z=%.2fm) result: %s",
+          altitude, target_altitude, current_local_z, response->message.c_str());
         {
           std::lock_guard<std::mutex> lk(mtx);
           done = true;
@@ -319,7 +332,7 @@ private:
       RCLCPP_ERROR(get_logger(), "Takeoff service call timeout");
     }
 
-    takeoff_altitude_ = altitude;
+    takeoff_altitude_ = target_altitude;
   }
 
   void velTimerCallback()
@@ -368,6 +381,7 @@ private:
   std::string mavros_set_mode_topic_;
   std::string mavros_vel_topic_;
   std::string mavros_takeoff_topic_;
+  double takeoff_target_clearance_m_;
   double vel_forward_rate_hz_;
   double vel_timeout_sec_;
   bool use_mock_;

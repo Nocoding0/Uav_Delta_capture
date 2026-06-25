@@ -88,9 +88,15 @@ BENCH RESULT: PASS
 
 ## 4. 上桨简单起降测试
 
-用途：上桨后首次自主短测，只做起飞、悬停、降落。
+用途：上桨后首次自主短测，只做起飞、悬停、降落。当前版本使用 MAVROS takeoff 起飞；为避免飞控拒绝低目标高度，takeoff 服务目标约为 `current_local_z + 0.2m`，任务达高仍按 rangefinder 相对高度 `0.6m` 判断，并在降落后等待落地/解锁确认。MAVROS takeoff 尚未达高时，任务节点只观察高度，不向 `/mavros/setpoint_velocity/cmd_vel` 连续发送零速度。
 
 前置：bench 已 PASS，且已完成手动 `ALT_HOLD/LOITER` 短悬停。
+
+遥控接管：
+
+- 空中异常：模式开关最终切到 `ALT_HOLD` 接管；如果开关已经在 `ALT_HOLD` 位，先拨到 `LOITER` 再拨回 `ALT_HOLD`。
+- 只拨右手摇杆不等于取消自主任务。
+- 已经落地且桨还在转：油门最低，ARM 开关先拨到解锁位，再拨回未解锁位停桨。
 
 ```bash
 docker exec -it ros2humble bash -lc "
@@ -104,28 +110,60 @@ docker exec -it ros2humble bash -lc "
 
 ```text
 TAKEOFF_LAND RESULT: PASS
+service_target
+Landing complete
 ```
 
-## 5. 上桨完整任务测试
+### 4.1 上桨 LOITER 悬停对比测试
 
-用途：上桨后完整任务，包含起飞、UWB 接近、下降、抓取占位、返航、投放占位、降落。
-
-前置：简单起降已 PASS，再做低高度、短距离测试。
+用途：在简单起降基础上，对比飞控 `LOITER` 定点悬停效果。流程是 `GUIDED` takeoff 起飞，到高度后先在 `GUIDED` 低高度稳定约 1.5 秒，再自动切 `LOITER` 悬停 5 秒，最后切回 `GUIDED` 并执行 `LAND`。如果 `LOITER` 悬停期间高度掉到近地阈值以下，会判失败并进入安全处理，不再继续计时判 PASS。
 
 ```bash
 docker exec -it ros2humble bash -lc "
   source /opt/ros/humble/setup.bash
   source /workspace/uav_delta_capture/install/setup.bash
-  ros2 launch uwb_navigation test_mission_real_full.launch.py
+  ros2 launch uwb_navigation test_mission_takeoff_loiter_land.launch.py
+"
+```
+
+关键通过标志：
+
+```text
+Takeoff OK
+service_target
+FCU mode confirmed: LOITER
+FCU mode confirmed: GUIDED
+Landing complete
+TAKEOFF_LOITER_LAND RESULT: PASS
+```
+
+## 5. 上桨 UWB 接近降落精简测试
+
+用途：在简单 GUIDED 起降通过后，先验证“起飞、UWB 接近 tag 正上方、悬停、原地降落”。这个模式不做抓取、复飞、返航、投放，是完整任务前的上桨精简版本。
+
+前置：简单起降已 PASS，UWB tag 放在地上，场地只做低高度、短距离测试。不要使用 LOITER 版本作为这个测试的前置。
+
+```bash
+docker exec -it ros2humble bash -lc "
+  source /opt/ros/humble/setup.bash
+  source /workspace/uav_delta_capture/install/setup.bash
+  ros2 launch uwb_navigation test_mission_uwb_approach_land.launch.py
 "
 ```
 
 关键日志：
 
 ```text
-Real preflight
-Phase: ...
+UWB approach-land preflight
+Takeoff OK
+Phase: HOVER_TAKEOFF -> MOVE_ABOVE
+UWB approach:
+Above target
+Phase: HOVER_ABOVE -> LAND
+UWB_APPROACH_LAND RESULT: PASS
 ```
+
+通过后再考虑恢复 `test_mission_real_full.launch.py` 的完整抓取、返航、投放流程。
 
 ## 6. 日志查看
 
@@ -137,8 +175,8 @@ docker exec ros2humble bash -lc "tail -160 /tmp/mavros.log"
 docker exec ros2humble bash -lc "grep -E 'Bench preflight|BENCH RESULT|Core links|Sensor links|Bench warnings|Phase|ERROR|WARN' /tmp/mission_bench.log | tail -160"
 
 # 简单起降后台日志
-docker exec ros2humble bash -lc "grep -E 'Takeoff-land preflight|TAKEOFF_LAND RESULT|Core links|Sensor links|Phase|Takeoff|Land|FAILSAFE|ERROR|WARN' /tmp/mission_takeoff_land.log | tail -160"
+docker exec ros2humble bash -lc "grep -E 'Takeoff-land preflight|TAKEOFF_LAND RESULT|Core links|Sensor links|Phase|Takeoff OK|Landing complete|LAND_WAIT|Takeoff|Land|FAILSAFE|ERROR|WARN' /tmp/mission_takeoff_land.log | tail -160"
 
-# 完整任务后台日志
-docker exec ros2humble bash -lc "grep -E 'Real preflight|Phase|UWB|local_pose|rangefinder|optical_flow|ARM|GUIDED|LAND|DONE|FAILSAFE|ERROR|WARN' /tmp/mission_real_full.log | tail -160"
+# UWB 接近降落精简任务后台日志
+docker exec ros2humble bash -lc "grep -E 'UWB approach-land preflight|UWB_APPROACH_LAND RESULT|Core links|Sensor links|Phase|Takeoff OK|UWB approach|Above target|Landing complete|LAND_WAIT|FAILSAFE|ERROR|WARN' /tmp/mission_uwb_approach_land.log | tail -180"
 ```

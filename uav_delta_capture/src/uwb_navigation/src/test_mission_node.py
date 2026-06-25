@@ -4,6 +4,8 @@
 Mission modes:
   - mock_full: pure software flow test.
   - bench_velocity: real hardware preflight + ARM + short Z velocity profile + DISARM.
+  - takeoff_loiter_land: climb gently in GUIDED, hover in LOITER, switch back to GUIDED, land.
+  - uwb_approach_land: low GUIDED takeoff, UWB approach to tag, hover, land.
   - real_full: take off, UWB approach, descend, fake/real grasp, climb, return, drop, land.
 """
 
@@ -53,6 +55,8 @@ class Phase(Enum):
     PAUSED_MANUAL = 17
     RECOVERING = 18
     FAILSAFE = 19
+    HOVER_LOITER = 20
+    LAND_WAIT = 21
 
 
 PHASE_NAMES = {phase: phase.name for phase in Phase}
@@ -118,6 +122,30 @@ class TestMissionNode(Node):
 
         self.takeoff_altitude = self.declare_parameter("takeoff_altitude", 1.5).value
         self.descend_altitude = self.declare_parameter("descend_altitude", 0.5).value
+        self.takeoff_method = self.declare_parameter("takeoff_method", "mavros").value
+        self.takeoff_climb_velocity = self.declare_parameter("takeoff_climb_velocity", 0.12).value
+        self.takeoff_command_delay_sec = self.declare_parameter(
+            "takeoff_command_delay_sec", 1.5
+        ).value
+        self.takeoff_height_timeout_sec = self.declare_parameter(
+            "takeoff_height_timeout_sec", 8.0
+        ).value
+        self.loiter_min_rel_alt = self.declare_parameter("loiter_min_rel_alt", 0.25).value
+        self.loiter_alt_loss_timeout_sec = self.declare_parameter(
+            "loiter_alt_loss_timeout_sec", 0.7
+        ).value
+        self.guided_pre_loiter_stable_time_sec = self.declare_parameter(
+            "guided_pre_loiter_stable_time_sec", 1.5
+        ).value
+        self.land_ground_rel_alt_threshold = self.declare_parameter(
+            "land_ground_rel_alt_threshold", 0.12
+        ).value
+        self.land_ground_stable_sec = self.declare_parameter(
+            "land_ground_stable_sec", 1.5
+        ).value
+        self.land_wait_timeout_sec = self.declare_parameter(
+            "land_wait_timeout_sec", 12.0
+        ).value
 
         self.kp_horizontal = self.declare_parameter("kp_horizontal", 0.4).value
         self.kp_vertical = self.declare_parameter("kp_vertical", 0.3).value
@@ -133,6 +161,12 @@ class TestMissionNode(Node):
 
         self.hover_stable_time = self.declare_parameter("hover_stable_time", 2.0).value
         self.control_rate_hz = self.declare_parameter("control_rate_hz", 20.0).value
+        self.move_above_timeout_sec = self.declare_parameter(
+            "move_above_timeout_sec", 20.0
+        ).value
+        self.uwb_missing_timeout_sec = self.declare_parameter(
+            "uwb_missing_timeout_sec", 3.0
+        ).value
 
         self.require_uwb_ready = self.declare_parameter("require_uwb_ready", True).value
         self.require_local_pose_ready = self.declare_parameter("require_local_pose_ready", True).value
@@ -163,6 +197,22 @@ class TestMissionNode(Node):
 
         self.takeoff_altitude = max(0.5, self.takeoff_altitude)
         self.descend_altitude = max(0.2, self.descend_altitude)
+        self.takeoff_method = str(self.takeoff_method).strip().lower()
+        if self.takeoff_method not in ("mavros", "velocity"):
+            self.takeoff_method = "mavros"
+        self.takeoff_climb_velocity = clamp(
+            abs(float(self.takeoff_climb_velocity)), 0.03, 0.25
+        )
+        self.takeoff_command_delay_sec = max(0.0, float(self.takeoff_command_delay_sec))
+        self.takeoff_height_timeout_sec = max(1.0, float(self.takeoff_height_timeout_sec))
+        self.loiter_min_rel_alt = max(0.05, float(self.loiter_min_rel_alt))
+        self.loiter_alt_loss_timeout_sec = max(0.1, float(self.loiter_alt_loss_timeout_sec))
+        self.guided_pre_loiter_stable_time_sec = max(
+            0.0, float(self.guided_pre_loiter_stable_time_sec)
+        )
+        self.land_ground_rel_alt_threshold = max(0.03, float(self.land_ground_rel_alt_threshold))
+        self.land_ground_stable_sec = max(0.2, float(self.land_ground_stable_sec))
+        self.land_wait_timeout_sec = max(2.0, float(self.land_wait_timeout_sec))
         self.kp_horizontal = max(0.01, self.kp_horizontal)
         self.kp_vertical = max(0.01, self.kp_vertical)
         self.kp_return = max(0.01, self.kp_return)
@@ -176,6 +226,8 @@ class TestMissionNode(Node):
             0.5, float(self.set_mode_service_timeout_sec)
         )
         self.mode_confirm_timeout_sec = max(0.5, float(self.mode_confirm_timeout_sec))
+        self.move_above_timeout_sec = max(1.0, float(self.move_above_timeout_sec))
+        self.uwb_missing_timeout_sec = max(0.2, float(self.uwb_missing_timeout_sec))
 
         self.phase = Phase.INIT
         self.previous_flight_phase = Phase.INIT
@@ -235,8 +287,20 @@ class TestMissionNode(Node):
         self._takeoff_land_takeoff_ok = False
         self._takeoff_land_hover_ok = False
         self._takeoff_land_land_ok = False
+        self._takeoff_land_loiter_ok = False
+        self._takeoff_land_guided_return_ok = False
+        self._uwb_approach_ok = False
         self._takeoff_land_result_reported = False
+        self._takeoff_land_abort_reason = None
         self._takeoff_wait_start_time = None
+        self._takeoff_delay_start_time = None
+        self._takeoff_climb_start_time = None
+        self._loiter_alt_loss_start_time = None
+        self._move_above_start_time = None
+        self._uwb_missing_start_time = None
+        self._land_wait_start_time = None
+        self._land_ground_start_time = None
+        self._land_disarm_sent = False
         self._shutdown_requested = False
 
         cb_group = ReentrantCallbackGroup()
@@ -277,7 +341,9 @@ class TestMissionNode(Node):
         self.get_logger().info(
             f"test_mission_node started: mode={self.mission_mode} "
             f"mock={str(self.use_mock).lower()} "
-            f"takeoff={self.takeoff_altitude:.1f}m descend={self.descend_altitude:.1f}m"
+            f"takeoff={self.takeoff_altitude:.1f}m descend={self.descend_altitude:.1f}m "
+            f"takeoff_method={self.takeoff_method} "
+            f"takeoff_delay={self.takeoff_command_delay_sec:.1f}s"
         )
 
     def _parse_modes(self, modes_text):
@@ -357,10 +423,12 @@ class TestMissionNode(Node):
             Phase.HOVER_RETURN: self._tick_hover_return,
             Phase.WAIT_DROP: self._tick_wait_drop,
             Phase.LAND: self._tick_land,
+            Phase.LAND_WAIT: self._tick_land_wait,
             Phase.DONE: self._tick_done,
             Phase.PAUSED_MANUAL: self._tick_paused_manual,
             Phase.RECOVERING: self._tick_recovering,
             Phase.FAILSAFE: self._tick_failsafe,
+            Phase.HOVER_LOITER: self._tick_hover_loiter,
         }
         tick_map[self.phase]()
         self._publish_state()
@@ -393,13 +461,24 @@ class TestMissionNode(Node):
 
         if self.phase not in (Phase.PAUSED_MANUAL, Phase.BENCH_VELOCITY):
             mode = (fcu.mode or "").upper()
-            if mode and mode not in self.auto_modes:
+            if mode and mode not in self._allowed_auto_modes():
                 self.previous_flight_phase = self.phase
                 self._publish_event(f"manual_takeover:{mode}")
                 self._transition(Phase.PAUSED_MANUAL)
                 return True
 
         return False
+
+    def _allowed_auto_modes(self):
+        modes = set(self.auto_modes)
+        if self._is_takeoff_loiter_land_mode():
+            if self.phase == Phase.HOVER_LOITER or self._pending_mode_target == "LOITER":
+                modes.add("LOITER")
+            else:
+                modes.discard("LOITER")
+        if self.phase == Phase.LAND_WAIT:
+            modes.add("LAND")
+        return modes
 
     def _uwb_valid_and_fresh(self) -> bool:
         if self.use_mock:
@@ -661,6 +740,33 @@ class TestMissionNode(Node):
         if self.mission_mode == "bench_velocity" and self.bench_exit_on_complete:
             self._shutdown_requested = True
 
+    def _is_takeoff_land_mode(self) -> bool:
+        return self.mission_mode in (
+            "takeoff_hover_land",
+            "takeoff_loiter_land",
+            "uwb_approach_land",
+        )
+
+    def _is_takeoff_loiter_land_mode(self) -> bool:
+        return self.mission_mode == "takeoff_loiter_land"
+
+    def _is_uwb_approach_land_mode(self) -> bool:
+        return self.mission_mode == "uwb_approach_land"
+
+    def _takeoff_land_label(self) -> str:
+        if self._is_takeoff_loiter_land_mode():
+            return "TAKEOFF_LOITER_LAND"
+        if self._is_uwb_approach_land_mode():
+            return "UWB_APPROACH_LAND"
+        return "TAKEOFF_LAND"
+
+    def _takeoff_land_text(self) -> str:
+        if self._is_takeoff_loiter_land_mode():
+            return "Takeoff-loiter-land"
+        if self._is_uwb_approach_land_mode():
+            return "UWB approach-land"
+        return "Takeoff-land"
+
     def _report_takeoff_land_result(self, force_fail_reason=None):
         if self._takeoff_land_result_reported:
             return
@@ -673,9 +779,18 @@ class TestMissionNode(Node):
             and self._takeoff_land_hover_ok
             and self._takeoff_land_land_ok
         )
+        if self._is_takeoff_loiter_land_mode():
+            core_ok = (
+                core_ok
+                and self._takeoff_land_loiter_ok
+                and self._takeoff_land_guided_return_ok
+            )
+        if self._is_uwb_approach_land_mode():
+            core_ok = core_ok and self._uwb_approach_ok
         sensor_ok = (
             snapshot["fcu_ok"]
             and snapshot["rc_ok"]
+            and ((not self._is_uwb_approach_land_mode()) or snapshot["uwb_ok"])
             and snapshot["pose_ok"]
             and snapshot["range_ok"]
             and snapshot["flow_ok"]
@@ -688,18 +803,41 @@ class TestMissionNode(Node):
             warnings.append(force_fail_reason)
 
         result = "PASS" if core_ok and sensor_ok and not force_fail_reason else "FAIL"
-        self.get_logger().info("========== TAKEOFF_LAND RESULT ==========")
-        self.get_logger().info(f"TAKEOFF_LAND RESULT: {result}")
-        self.get_logger().info(
-            "Core links: "
-            f"ARM={'OK' if self._bench_arm_ok else 'FAIL'} "
-            f"TAKEOFF={'OK' if self._takeoff_land_takeoff_ok else 'FAIL'} "
-            f"HOVER={'OK' if self._takeoff_land_hover_ok else 'FAIL'} "
-            f"LAND={'OK' if self._takeoff_land_land_ok else 'FAIL'}"
-        )
+        label = self._takeoff_land_label()
+        text = self._takeoff_land_text()
+        self.get_logger().info(f"========== {label} RESULT ==========")
+        self.get_logger().info(f"{label} RESULT: {result}")
+        if self._is_takeoff_loiter_land_mode():
+            core_text = (
+                "Core links: "
+                f"ARM={'OK' if self._bench_arm_ok else 'FAIL'} "
+                f"TAKEOFF={'OK' if self._takeoff_land_takeoff_ok else 'FAIL'} "
+                f"LOITER={'OK' if self._takeoff_land_loiter_ok else 'FAIL'} "
+                f"HOVER={'OK' if self._takeoff_land_hover_ok else 'FAIL'} "
+                f"GUIDED_BACK={'OK' if self._takeoff_land_guided_return_ok else 'FAIL'} "
+                f"LAND={'OK' if self._takeoff_land_land_ok else 'FAIL'}"
+            )
+        elif self._is_uwb_approach_land_mode():
+            core_text = (
+                "Core links: "
+                f"ARM={'OK' if self._bench_arm_ok else 'FAIL'} "
+                f"TAKEOFF={'OK' if self._takeoff_land_takeoff_ok else 'FAIL'} "
+                f"HOVER={'OK' if self._takeoff_land_hover_ok else 'FAIL'} "
+                f"UWB_APPROACH={'OK' if self._uwb_approach_ok else 'FAIL'} "
+                f"LAND={'OK' if self._takeoff_land_land_ok else 'FAIL'}"
+            )
+        else:
+            core_text = (
+                "Core links: "
+                f"ARM={'OK' if self._bench_arm_ok else 'FAIL'} "
+                f"TAKEOFF={'OK' if self._takeoff_land_takeoff_ok else 'FAIL'} "
+                f"HOVER={'OK' if self._takeoff_land_hover_ok else 'FAIL'} "
+                f"LAND={'OK' if self._takeoff_land_land_ok else 'FAIL'}"
+            )
+        self.get_logger().info(core_text)
         self.get_logger().info(f"Sensor links: {self._format_bench_snapshot(snapshot)}")
         if warnings:
-            self.get_logger().warn("Takeoff-land warnings: " + "; ".join(warnings))
+            self.get_logger().warn(f"{text} warnings: " + "; ".join(warnings))
         self.get_logger().info("=========================================")
         self._shutdown_requested = True
 
@@ -719,18 +857,20 @@ class TestMissionNode(Node):
                 "Bench preflight: " + self._format_bench_snapshot(snapshot),
                 throttle_duration_sec=5.0,
             )
-        elif self.mission_mode == "takeoff_hover_land":
+        elif self._is_takeoff_land_mode():
             snapshot = self._bench_snapshot()
             required_ok = (
                 snapshot["fcu_ok"]
                 and snapshot["rc_ok"]
+                and ((not self._is_uwb_approach_land_mode()) or snapshot["uwb_ok"])
                 and snapshot["pose_ok"]
                 and snapshot["range_ok"]
                 and snapshot["flow_ok"]
                 and snapshot["set_mode_ok"]
             )
             self.get_logger().info(
-                "Takeoff-land preflight: " + self._format_bench_snapshot(snapshot),
+                f"{self._takeoff_land_text()} preflight: "
+                + self._format_bench_snapshot(snapshot),
                 throttle_duration_sec=5.0,
             )
             if not required_ok:
@@ -739,6 +879,8 @@ class TestMissionNode(Node):
                     self._publish_preflight_event(wait_event)
                 if not snapshot["rc_ok"]:
                     self.get_logger().warn("Waiting for RC/manual_input...", throttle_duration_sec=5.0)
+                if self._is_uwb_approach_land_mode() and not snapshot["uwb_ok"]:
+                    self.get_logger().warn("Waiting for UWB...", throttle_duration_sec=5.0)
                 if not snapshot["pose_ok"]:
                     self.get_logger().warn("Waiting for local pose...", throttle_duration_sec=5.0)
                 if not snapshot["range_ok"]:
@@ -812,7 +954,7 @@ class TestMissionNode(Node):
         self.get_logger().info(f"Arm OK: {msg}")
         self._publish_event("armed")
         self._command_retry_count = 0
-        if self.mission_mode in ("bench_velocity", "takeoff_hover_land"):
+        if self.mission_mode == "bench_velocity" or self._is_takeoff_land_mode():
             self._bench_arm_ok = True
 
         if self.mission_mode == "bench_velocity":
@@ -883,13 +1025,41 @@ class TestMissionNode(Node):
                 )
                 return
             self.get_logger().error("TAKEOFF blocked: armed state was not confirmed after ARM")
-            if self.mission_mode == "takeoff_hover_land":
+            if self._is_takeoff_land_mode():
                 self._report_takeoff_land_result("ARM state not confirmed before TAKEOFF")
             self._transition(Phase.FAILSAFE)
             return
 
+        now = self.get_clock().now()
         self._takeoff_wait_start_time = None
+        if self.takeoff_command_delay_sec > 0.0:
+            if self._takeoff_delay_start_time is None:
+                self._takeoff_delay_start_time = now
+                self.get_logger().info(
+                    f"Waiting {self.takeoff_command_delay_sec:.1f}s before TAKEOFF command..."
+                )
+                return
+            delay_elapsed = (now - self._takeoff_delay_start_time).nanoseconds / 1e9
+            if delay_elapsed < self.takeoff_command_delay_sec:
+                self.get_logger().info(
+                    f"Waiting before TAKEOFF command ({delay_elapsed:.1f}/"
+                    f"{self.takeoff_command_delay_sec:.1f}s)...",
+                    throttle_duration_sec=1.0,
+                )
+                return
+
+        self._takeoff_delay_start_time = None
         self._record_origin()
+        if self._is_takeoff_land_mode() and self.takeoff_method == "velocity":
+            self._takeoff_climb_start_time = now
+            self.get_logger().info(
+                f"Starting velocity takeoff: vz={self.takeoff_climb_velocity:.2f}m/s "
+                f"target_rel_alt={self.takeoff_altitude:.2f}m"
+            )
+            self._publish_event("takeoff_velocity_started")
+            self._transition(Phase.HOVER_TAKEOFF)
+            return
+
         self._pending_command = True
         self._call_flight_cmd(
             FlightCommand.Request.CMD_TAKEOFF,
@@ -902,12 +1072,13 @@ class TestMissionNode(Node):
         if success:
             self.get_logger().info(f"Takeoff OK: {msg}")
             self._takeoff_land_takeoff_ok = True
+            self._takeoff_climb_start_time = self.get_clock().now()
             self._publish_event("takeoff_accepted")
             self._transition(Phase.HOVER_TAKEOFF)
         else:
             self.get_logger().error(f"Takeoff FAILED: {msg}")
-            if self.mission_mode == "takeoff_hover_land":
-                self._report_takeoff_land_result("TAKEOFF failed")
+            if self._is_takeoff_land_mode():
+                self._takeoff_land_abort_reason = "TAKEOFF failed"
             self._transition(Phase.FAILSAFE)
 
     def _tick_hover_takeoff(self):
@@ -918,10 +1089,13 @@ class TestMissionNode(Node):
             )
             return
 
-        if self.mission_mode == "takeoff_hover_land":
+        if self._is_takeoff_land_mode():
             rel_alt, source = self._get_takeoff_land_relative_altitude()
+            now = self.get_clock().now()
             if rel_alt is None:
                 self.hover_start_time = None
+                if self.takeoff_method == "velocity":
+                    self._publish_velocity(0.0, 0.0, 0.0)
                 self.get_logger().warn(
                     "Waiting for relative takeoff altitude source...",
                     throttle_duration_sec=1.0,
@@ -931,6 +1105,41 @@ class TestMissionNode(Node):
             target_reached = rel_alt >= max(0.0, self.takeoff_altitude - self.altitude_tolerance)
             if target_reached:
                 self._publish_velocity(0.0, 0.0, 0.0)
+                self._takeoff_land_takeoff_ok = True
+                self._takeoff_climb_start_time = None
+                if self._is_takeoff_loiter_land_mode():
+                    if self.hover_start_time is None:
+                        self.hover_start_time = now
+                        self.get_logger().info(
+                            f"Takeoff height reached at rel_alt={rel_alt:.2f}m ({source}), "
+                            "holding GUIDED before LOITER"
+                        )
+                        return
+                    pre_loiter_elapsed = (now - self.hover_start_time).nanoseconds / 1e9
+                    if pre_loiter_elapsed < self.guided_pre_loiter_stable_time_sec:
+                        self.get_logger().info(
+                            f"GUIDED pre-LOITER hold {pre_loiter_elapsed:.1f}/"
+                            f"{self.guided_pre_loiter_stable_time_sec:.1f}s at "
+                            f"rel_alt={rel_alt:.2f}m ({source})",
+                            throttle_duration_sec=1.0,
+                        )
+                        return
+                    self.get_logger().info(
+                        f"GUIDED pre-LOITER hold stable at rel_alt={rel_alt:.2f}m "
+                        f"({source}), switching to LOITER"
+                    )
+                    self.hover_start_time = None
+                    self._start_mode_switch("LOITER", Phase.HOVER_LOITER, warn_only=False)
+                    return
+                if self._is_uwb_approach_land_mode():
+                    self._check_stable_and_transition(
+                        Phase.MOVE_ABOVE,
+                        f"Takeoff hover stable at rel_alt={rel_alt:.2f}m ({source}), starting UWB approach",
+                        "takeoff_hover_stable",
+                    )
+                    if self.phase == Phase.MOVE_ABOVE:
+                        self._takeoff_land_hover_ok = True
+                    return
                 self._check_stable_and_transition(
                     Phase.LAND,
                     f"Takeoff-land hover stable at rel_alt={rel_alt:.2f}m ({source})",
@@ -941,8 +1150,33 @@ class TestMissionNode(Node):
                 return
 
             self.hover_start_time = None
+            if self._takeoff_climb_start_time is None:
+                self._takeoff_climb_start_time = now
+            climb_elapsed = (now - self._takeoff_climb_start_time).nanoseconds / 1e9
+            if climb_elapsed >= self.takeoff_height_timeout_sec:
+                self._publish_velocity(0.0, 0.0, 0.0)
+                reason = (
+                    f"TAKEOFF height timeout: rel_alt={rel_alt:.2f}/"
+                    f"{self.takeoff_altitude:.2f}m ({source})"
+                )
+                self.get_logger().error(reason)
+                self._takeoff_land_abort_reason = reason
+                self._transition(Phase.FAILSAFE)
+                return
+
+            if self.takeoff_method == "velocity":
+                self._publish_velocity(0.0, 0.0, self.takeoff_climb_velocity)
+                self.get_logger().info(
+                    f"Velocity takeoff climbing: rel_alt={rel_alt:.2f}/"
+                    f"{self.takeoff_altitude:.2f}m ({source}) "
+                    f"vz={self.takeoff_climb_velocity:.2f}m/s",
+                    throttle_duration_sec=1.0,
+                )
+                return
+
             self.get_logger().info(
-                f"Waiting for takeoff height: rel_alt={rel_alt:.2f}/{self.takeoff_altitude:.2f}m ({source})",
+                f"Waiting for MAVROS takeoff height: rel_alt={rel_alt:.2f}/"
+                f"{self.takeoff_altitude:.2f}m ({source})",
                 throttle_duration_sec=1.0,
             )
             return
@@ -956,18 +1190,113 @@ class TestMissionNode(Node):
         else:
             self.hover_start_time = None
 
+    def _tick_hover_loiter(self):
+        self._publish_velocity(0.0, 0.0, 0.0)
+        rel_alt, source = self._get_takeoff_land_relative_altitude()
+        alt_text = "rel_alt=missing"
+        if rel_alt is not None:
+            alt_text = f"rel_alt={rel_alt:.2f}m ({source})"
+
+        now = self.get_clock().now()
+        if rel_alt is None:
+            self.hover_start_time = None
+            self._loiter_alt_loss_start_time = None
+            self.get_logger().warn(
+                "LOITER hover waiting for relative altitude source...",
+                throttle_duration_sec=1.0,
+            )
+            return
+
+        if rel_alt < self.loiter_min_rel_alt:
+            self.hover_start_time = None
+            if self._loiter_alt_loss_start_time is None:
+                self._loiter_alt_loss_start_time = now
+                self.get_logger().warn(
+                    f"LOITER hover altitude low at {alt_text}; waiting before failsafe"
+                )
+                return
+            low_elapsed = (now - self._loiter_alt_loss_start_time).nanoseconds / 1e9
+            if low_elapsed >= self.loiter_alt_loss_timeout_sec:
+                reason = (
+                    f"LOITER altitude lost: rel_alt={rel_alt:.2f}m below "
+                    f"{self.loiter_min_rel_alt:.2f}m"
+                )
+                self.get_logger().error(reason)
+                self._takeoff_land_abort_reason = reason
+                self._transition(Phase.FAILSAFE)
+                return
+            self.get_logger().warn(
+                f"LOITER hover altitude low {low_elapsed:.1f}/"
+                f"{self.loiter_alt_loss_timeout_sec:.1f}s at {alt_text}",
+                throttle_duration_sec=0.5,
+            )
+            return
+
+        self._loiter_alt_loss_start_time = None
+        if self.hover_start_time is None:
+            self.hover_start_time = now
+            self.get_logger().info(f"LOITER hover started at {alt_text}, stabilizing")
+            return
+
+        elapsed = (now - self.hover_start_time).nanoseconds / 1e9
+        if elapsed >= self.hover_stable_time:
+            self.get_logger().info(f"LOITER hover stable at {alt_text}")
+            self._publish_event("takeoff_loiter_hover_stable")
+            self._takeoff_land_hover_ok = True
+            self._start_mode_switch("GUIDED", Phase.LAND, warn_only=False)
+            return
+
+        self.get_logger().info(
+            f"LOITER hover holding {elapsed:.1f}/{self.hover_stable_time:.1f}s at {alt_text}",
+            throttle_duration_sec=1.0,
+        )
+
     def _tick_move_above(self):
         if self.use_mock:
             self.get_logger().info("Mock MOVE_ABOVE complete")
             self._transition(Phase.HOVER_ABOVE)
             return
 
+        now = self.get_clock().now()
+        if self._is_uwb_approach_land_mode() and self._move_above_start_time is None:
+            self._move_above_start_time = now
+            self._uwb_missing_start_time = None
+
+        if self._is_uwb_approach_land_mode() and self._move_above_start_time is not None:
+            move_elapsed = (now - self._move_above_start_time).nanoseconds / 1e9
+            if move_elapsed >= self.move_above_timeout_sec:
+                self._publish_velocity(0.0, 0.0, 0.0)
+                reason = f"UWB approach timeout after {move_elapsed:.1f}s"
+                self.get_logger().error(reason)
+                self._takeoff_land_abort_reason = reason
+                self._transition(Phase.FAILSAFE)
+                return
+
         uwb = self._get_uwb()
         if uwb is None or not self._uwb_valid_and_fresh():
-            self.get_logger().warn("No fresh UWB data, hovering", throttle_duration_sec=2.0)
             self._publish_velocity(0.0, 0.0, 0.0)
+            if self._is_uwb_approach_land_mode():
+                if self._uwb_missing_start_time is None:
+                    self._uwb_missing_start_time = now
+                    self.get_logger().warn("No fresh UWB data during approach, hovering")
+                    return
+                missing_elapsed = (now - self._uwb_missing_start_time).nanoseconds / 1e9
+                if missing_elapsed >= self.uwb_missing_timeout_sec:
+                    reason = f"UWB data lost for {missing_elapsed:.1f}s during approach"
+                    self.get_logger().error(reason)
+                    self._takeoff_land_abort_reason = reason
+                    self._transition(Phase.FAILSAFE)
+                    return
+                self.get_logger().warn(
+                    f"No fresh UWB data during approach "
+                    f"{missing_elapsed:.1f}/{self.uwb_missing_timeout_sec:.1f}s",
+                    throttle_duration_sec=0.5,
+                )
+                return
+            self.get_logger().warn("No fresh UWB data, hovering", throttle_duration_sec=2.0)
             return
 
+        self._uwb_missing_start_time = None
         azimuth, distance, _ = uwb
         az_rad = azimuth * math.pi / 180.0
         horizontal_dist = distance * math.cos(az_rad)
@@ -979,7 +1308,13 @@ class TestMissionNode(Node):
         if horizontal_dist > self.horizontal_deadband:
             vy = clamp(-self.kp_horizontal * horizontal_dist, -self.max_vel_xy, self.max_vel_xy)
 
-        alt_err = self.takeoff_altitude - self._get_fcu_altitude()
+        if self._is_uwb_approach_land_mode():
+            rel_alt, alt_source = self._get_takeoff_land_relative_altitude()
+            alt_err = 0.0 if rel_alt is None else self.takeoff_altitude - rel_alt
+        else:
+            rel_alt = self._get_fcu_altitude()
+            alt_source = "local_z_abs"
+            alt_err = self.takeoff_altitude - rel_alt
         vz = clamp(self.kp_vertical * alt_err, -self.max_vel_z, self.max_vel_z)
 
         self._publish_velocity(vx, vy, vz)
@@ -990,11 +1325,25 @@ class TestMissionNode(Node):
                 f"Above target: az={azimuth:.1f}deg hdist={horizontal_dist:.2f}m",
                 "above_target_reached",
             )
+            if self.phase == Phase.HOVER_ABOVE and self._is_uwb_approach_land_mode():
+                self._uwb_approach_ok = True
         else:
             self.hover_start_time = None
+            alt_text = "missing" if rel_alt is None else f"{rel_alt:.2f}m"
+            self.get_logger().info(
+                f"UWB approach: az={azimuth:.1f}deg hdist={horizontal_dist:.2f}m "
+                f"rel_alt={alt_text} ({alt_source}) "
+                f"cmd=({vx:.2f},{vy:.2f},{vz:.2f})",
+                throttle_duration_sec=1.0,
+            )
 
     def _tick_hover_above(self):
         self._publish_velocity(0.0, 0.0, 0.0)
+        if self._is_uwb_approach_land_mode():
+            self._check_stable_and_transition(
+                Phase.LAND, "UWB target hover stable, landing", "uwb_target_hover_done"
+            )
+            return
         self._check_stable_and_transition(
             Phase.DESCEND, "Hover above target stable", "hover_above_done"
         )
@@ -1193,18 +1542,97 @@ class TestMissionNode(Node):
         if success:
             self.get_logger().info(f"Land OK: {msg}")
             self._publish_event("landing")
-            if self.mission_mode == "takeoff_hover_land":
-                self._takeoff_land_land_ok = True
-            self._transition(Phase.DONE)
-            reset_msg = String()
-            reset_msg.data = "RESET"
-            self.flight_reset_pub.publish(reset_msg)
-            if self.mission_mode == "takeoff_hover_land":
-                self._report_takeoff_land_result()
+            self._transition(Phase.LAND_WAIT)
         else:
             self.get_logger().error(f"Land FAILED: {msg}, retrying")
-            if self.mission_mode == "takeoff_hover_land":
+            if self._is_takeoff_land_mode():
                 self._report_takeoff_land_result("LAND failed")
+
+    def _tick_land_wait(self):
+        self._publish_velocity(0.0, 0.0, 0.0)
+        now = self.get_clock().now()
+        if self._land_wait_start_time is None:
+            self._land_wait_start_time = now
+            self._land_ground_start_time = None
+            self._land_disarm_sent = False
+
+        rel_alt, source = self._get_takeoff_land_relative_altitude()
+        alt_text = "rel_alt=missing"
+        if rel_alt is not None:
+            alt_text = f"rel_alt={rel_alt:.2f}m ({source})"
+
+        if not self._armed_confirmed():
+            self.get_logger().info(f"Landing complete: disarmed with {alt_text}")
+            self._finish_landing_success()
+            return
+
+        wait_elapsed = (now - self._land_wait_start_time).nanoseconds / 1e9
+        near_ground = rel_alt is not None and rel_alt <= self.land_ground_rel_alt_threshold
+        if near_ground:
+            if self._land_ground_start_time is None:
+                self._land_ground_start_time = now
+                self.get_logger().info(
+                    f"Landing near ground at {alt_text}, waiting stable before DISARM"
+                )
+                return
+            ground_elapsed = (now - self._land_ground_start_time).nanoseconds / 1e9
+            if ground_elapsed >= self.land_ground_stable_sec:
+                if self._pending_command:
+                    return
+                if not self._land_disarm_sent:
+                    self._land_disarm_sent = True
+                    self._pending_command = True
+                    self.get_logger().info(
+                        f"Landing ground confirmed at {alt_text}; sending DISARM"
+                    )
+                    self._call_flight_cmd(
+                        FlightCommand.Request.CMD_DISARM,
+                        0.0,
+                        self._on_land_disarm_result,
+                    )
+                return
+            self.get_logger().info(
+                f"Landing ground stable wait {ground_elapsed:.1f}/"
+                f"{self.land_ground_stable_sec:.1f}s at {alt_text}",
+                throttle_duration_sec=0.5,
+            )
+            return
+
+        self._land_ground_start_time = None
+        if wait_elapsed >= self.land_wait_timeout_sec:
+            reason = f"LAND wait timeout after {wait_elapsed:.1f}s at {alt_text}"
+            self.get_logger().error(reason)
+            if self._is_takeoff_land_mode():
+                self._report_takeoff_land_result(reason)
+            self._transition(Phase.FAILSAFE)
+            return
+
+        self.get_logger().info(
+            f"Landing wait {wait_elapsed:.1f}/{self.land_wait_timeout_sec:.1f}s at {alt_text}",
+            throttle_duration_sec=1.0,
+        )
+
+    def _on_land_disarm_result(self, success: bool, msg: str):
+        self._pending_command = False
+        if success or not self._armed_confirmed():
+            self.get_logger().info(f"Landing DISARM: {'OK' if success else 'already disarmed'} - {msg}")
+            self._finish_landing_success()
+            return
+        reason = f"Landing DISARM failed: {msg}"
+        self.get_logger().error(reason)
+        if self._is_takeoff_land_mode():
+            self._report_takeoff_land_result(reason)
+        self._transition(Phase.FAILSAFE)
+
+    def _finish_landing_success(self):
+        if self._is_takeoff_land_mode():
+            self._takeoff_land_land_ok = True
+        self._transition(Phase.DONE)
+        reset_msg = String()
+        reset_msg.data = "RESET"
+        self.flight_reset_pub.publish(reset_msg)
+        if self._is_takeoff_land_mode():
+            self._report_takeoff_land_result(self._takeoff_land_abort_reason)
 
     def _tick_done(self):
         self._publish_velocity(0.0, 0.0, 0.0)
@@ -1239,13 +1667,37 @@ class TestMissionNode(Node):
         self._publish_velocity(0.0, 0.0, 0.0)
         if self._pending_command:
             return
+
+        command = FlightCommand.Request.CMD_MODE_LAND
+        command_name = "LAND"
+        if self._takeoff_land_abort_reason and not self._takeoff_land_takeoff_ok:
+            rel_alt, _ = self._get_takeoff_land_relative_altitude()
+            if rel_alt is not None and rel_alt < 0.25:
+                command = FlightCommand.Request.CMD_DISARM
+                command_name = "DISARM"
+
         self._pending_command = True
+
+        def _on_failsafe_result(ok, msg):
+            self._pending_command = False
+            self.get_logger().info(
+                f"Failsafe {command_name}: {'OK' if ok else 'FAILED'} - {msg}"
+            )
+            if ok and command == FlightCommand.Request.CMD_MODE_LAND:
+                self._transition(Phase.LAND_WAIT)
+                return
+            if self._is_takeoff_land_mode():
+                reason = self._takeoff_land_abort_reason
+                if not reason and not ok:
+                    reason = f"FAILSAFE {command_name} failed"
+                self._report_takeoff_land_result(reason)
+            if ok and command == FlightCommand.Request.CMD_DISARM:
+                self._transition(Phase.DONE)
+
         self._call_flight_cmd(
-            FlightCommand.Request.CMD_MODE_LAND,
+            command,
             0.0,
-            lambda ok, msg: self.get_logger().info(
-                f"Failsafe LAND: {'OK' if ok else 'FAILED'} - {msg}"
-            ),
+            _on_failsafe_result,
         )
 
     def _record_origin(self):
@@ -1291,6 +1743,18 @@ class TestMissionNode(Node):
             self.drop_start_time = None
         if new_phase != Phase.TAKEOFF:
             self._takeoff_wait_start_time = None
+            self._takeoff_delay_start_time = None
+        if new_phase != Phase.HOVER_TAKEOFF:
+            self._takeoff_climb_start_time = None
+        if new_phase != Phase.HOVER_LOITER:
+            self._loiter_alt_loss_start_time = None
+        if new_phase != Phase.MOVE_ABOVE:
+            self._move_above_start_time = None
+            self._uwb_missing_start_time = None
+        if new_phase != Phase.LAND_WAIT:
+            self._land_wait_start_time = None
+            self._land_ground_start_time = None
+            self._land_disarm_sent = False
 
     def _publish_velocity(self, vx: float, vy: float, vz: float):
         now = self.get_clock().now()
@@ -1345,6 +1809,8 @@ class TestMissionNode(Node):
             return "preflight_wait:fcu"
         if not snapshot["rc_ok"]:
             return "preflight_wait:rc_manual_input"
+        if self._is_uwb_approach_land_mode() and not snapshot["uwb_ok"]:
+            return "preflight_wait:uwb"
         if not snapshot["pose_ok"]:
             return "preflight_wait:local_pose"
         if not snapshot["range_ok"]:
@@ -1430,6 +1896,14 @@ class TestMissionNode(Node):
             self.get_logger().info(f"FCU mode confirmed: {target}")
             if self.mission_mode == "bench_velocity" and target == "GUIDED":
                 self._bench_guided_ok = True
+            if self._is_takeoff_loiter_land_mode() and target == "LOITER":
+                self._takeoff_land_loiter_ok = True
+            if (
+                self._is_takeoff_loiter_land_mode()
+                and target == "GUIDED"
+                and next_phase == Phase.LAND
+            ):
+                self._takeoff_land_guided_return_ok = True
             self._clear_pending_mode_switch()
             if next_phase == Phase.BENCH_VELOCITY:
                 self.bench_start_time = self.get_clock().now()
@@ -1509,7 +1983,7 @@ class TestMissionNode(Node):
             return
 
         self._publish_velocity(0.0, 0.0, 0.0)
-        if self.mission_mode == "takeoff_hover_land":
+        if self._is_takeoff_land_mode():
             self._report_takeoff_land_result(reason)
         self._transition(Phase.FAILSAFE)
 

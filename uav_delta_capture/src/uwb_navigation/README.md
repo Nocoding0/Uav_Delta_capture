@@ -30,12 +30,13 @@ colcon build --packages-select fcu_bridge uwb_driver uwb_navigation --parallel-w
 source /workspace/uav_delta_capture/install/setup.bash
 ```
 
-## 三种任务模式
+## 任务模式
 
 | 模式 | Launch 文件 | 配置文件 | 是否需要真实硬件 | 用途 |
 |---|---|---|---|---|
 | `mock_full` | `test_mission.launch.py` | `test_mission_mock.yaml` | 否 | 全软件状态机和 ROS 链路测试 |
 | `bench_velocity` | `test_mission_bench.launch.py` | `test_mission_bench.yaml` | FCU 必需，UWB/测距/光流/本地位置仅监测 | 不上桨叶，ARM 后发送 Z 轴速度曲线再 DISARM |
+| `uwb_approach_land` | `test_mission_uwb_approach_land.launch.py` | `test_mission_uwb_approach_land.yaml` | 完整硬件 | 低高度 GUIDED 起飞、UWB 接近 tag 上方、悬停、原地降落 |
 | `real_full` | `test_mission_real_full.launch.py` | `test_mission_real.yaml` | 完整硬件 | 完整起飞、UWB 接近、下降、抓取占位、返航、投放占位、降落 |
 
 `test_mission_real.launch.py` 目前是兼容旧命名的 bench 入口，实际等价于 `test_mission_bench.launch.py`。
@@ -443,17 +444,24 @@ Core links: ARM=OK TAKEOFF=OK HOVER=OK LAND=OK
 Sensor links: FCU=OK ... RC=OK ... rangefinder=OK ... optical_flow=OK local_pose=OK set_mode_srv=OK
 ```
 
-通过后再进入小范围 GUIDED 速度闭环测试，最后才跑低高度短距离 `real_full`。
+通过后再进入小范围 GUIDED 速度闭环测试，然后跑 `uwb_approach_land`，最后才跑低高度短距离 `real_full`。
+
+LOITER 对比测试使用 `test_mission_takeoff_loiter_land.launch.py`。它沿用简单起降的 MAVROS takeoff 逻辑，到达目标相对高度后先在 `GUIDED` 稳定约 1.5 秒，再切 `LOITER` 悬停，随后切回 `GUIDED` 执行 `LAND`。这个测试用于比较飞控 `LOITER` 定点保持效果，不验证 UWB 接近。
+
+UWB 接近降落精简测试使用 `test_mission_uwb_approach_land.launch.py`。它沿用简单起降的 MAVROS takeoff 逻辑，到达低高度后保持 `GUIDED`，使用 UWB 方位和距离低速移动到 tag 上方，悬停确认后直接 `LAND`。这个测试不做抓取、复飞、返航、投放，是 `real_full` 前的上桨过渡入口。
 
 如果失败：
 
 - `Arm: Throttle (RC3) is not neutral`：油门杆没有在飞控认可的最低/中立位置，先调整油门杆，再查 RC3 校准。
+- `Takeoff OK` 后只转桨但 rangefinder 相对高度不涨：检查 MAVROS takeoff 等待阶段是否有连续 `/mavros/setpoint_velocity/cmd_vel` 零速度；低高度起飞不应一边用 CommandTOL 起飞一边持续发零速度。
 - `local_pose=WAIT`：不要上桨继续测，先回到 MAVROS 本地位置和 EKF origin 排查。
 - `rangefinder=WAIT` 或 `optical_flow=WAIT`：不要跑自主起降，先确认测距、光流供电、安装方向和 MAVROS 话题。
 
-### 5. 低高度短距离 real_full
+### 5. 低高度 UWB 接近降落与 real_full
 
-用途：执行完整任务状态机。该模式有真实起飞、移动、下降、返航和降落动作，只能在去桨检查、传感器检查、遥控接管验证、场地安全确认之后分阶段测试。
+第一步先执行 `uwb_approach_land`：真实起飞，UWB 接近 tag 上方，悬停，原地降落。该模式不做抓取、复飞、返航和投放，用来验证 UWB 接近方向、速度和安全边界。
+
+第二步才执行 `real_full`：完整任务状态机，有真实起飞、移动、下降、返航和降落动作，只能在去桨检查、传感器检查、遥控接管验证、场地安全确认之后分阶段测试。
 
 当前硬门槛：`real_full` 必须等到 `/mavros/local_position/pose` 有连续数据才会继续。不要把 `require_local_pose_ready` 改成 `false` 绕过这条保护；没有本地位置时，GUIDED 速度控制和返航都不可靠。
 
@@ -510,21 +518,20 @@ docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 10 
 docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/local_position/pose --qos-reliability best_effort --once"
 ```
 
-启动完整任务：
+启动 UWB 接近降落精简任务：
 
 ```bash
 docker exec -it ros2humble bash -c "
   source /opt/ros/humble/setup.bash
   source /workspace/uav_delta_capture/install/setup.bash
-  ros2 launch uwb_navigation test_mission_real_full.launch.py
+  ros2 launch uwb_navigation test_mission_uwb_approach_land.launch.py
 "
 ```
 
-`real_full` 启动后会打印 `Real preflight`，其中：
+`uwb_approach_land` 启动后会打印 `UWB approach-land preflight`，其中：
 
 - `UWB=OK`、`rangefinder=OK`、`optical_flow=OK` 表示上位机能看到对应链路。
 - `local_pose=WAIT` 表示飞控还没有输出本地位置，任务会继续等待，不会进入 ARM。
-- `estimator=WAIT` 或 `vel_h/vel_v=WAIT` 表示 EKF 估计还不满足，先回到飞控参数和 EKF origin 排查。
 
 分阶段真实飞行建议：
 
@@ -532,7 +539,8 @@ docker exec -it ros2humble bash -c "
 2. 解决 `/mavros/local_position/pose` 后，再跑一次 bench，目标是 `local_pose=OK`。
 3. 上桨后先手动 `ALT_HOLD/LOITER` 短悬停，验证高度、光流、测距稳定。
 4. 再验证 GUIDED 小速度 setpoint，观察 `/mavros/rc/out` 和机体响应。
-5. 最后低高度、短距离跑 `real_full`，先保留 `fake_grasp=true`、`fake_drop=true`。
+5. 跑 `uwb_approach_land`，验证 UWB 接近方向、速度和降落。
+6. 最后低高度、短距离跑 `real_full`，先保留 `fake_grasp=true`、`fake_drop=true`。
 
 后台运行并保存日志：
 
@@ -540,7 +548,7 @@ docker exec -it ros2humble bash -c "
 docker exec -d ros2humble bash -c "
   source /opt/ros/humble/setup.bash
   source /workspace/uav_delta_capture/install/setup.bash
-  ros2 launch uwb_navigation test_mission_real_full.launch.py > /tmp/mission_real_full.log 2>&1
+  ros2 launch uwb_navigation test_mission_uwb_approach_land.launch.py > /tmp/mission_uwb_approach_land.log 2>&1
 "
 ```
 
@@ -659,7 +667,7 @@ docker restart ros2humble
 
 测试方法：
 
-1. 启动 bench 或 real_full。
+1. 启动 bench、`uwb_approach_land` 或 real_full。
 2. 用遥控器或地面站把飞控切出 `GUIDED`。
 3. 查看 `/test_mission/state`，应变为 `PAUSED_MANUAL`。
 4. 查看 `/cmd_vel`，应接近零速度。
@@ -669,7 +677,7 @@ docker restart ros2humble
 
 | 参数 | 说明 |
 |---|---|
-| `mission_mode` | `mock_full`、`bench_velocity`、`takeoff_hover_land` 或 `real_full` |
+| `mission_mode` | `mock_full`、`bench_velocity`、`takeoff_hover_land`、`uwb_approach_land` 或 `real_full` |
 | `require_uwb_ready` | `INIT` 阶段是否等待 UWB 数据有效 |
 | `require_local_pose_ready` | `INIT` 阶段是否等待本地位置有效 |
 | `takeoff_altitude` | 起飞和返航阶段使用的固定高度 |
@@ -677,6 +685,8 @@ docker restart ros2humble
 | `max_vel_xy` | 水平最大速度 |
 | `max_vel_z` | 垂直最大速度 |
 | `velocity_slew_rate` | 速度变化限幅，用于平滑指令 |
+| `move_above_timeout_sec` | UWB 接近阶段最长持续时间，超时后进入安全降落 |
+| `uwb_missing_timeout_sec` | UWB 接近阶段允许 UWB 数据连续丢失的最长时间 |
 | `bench_velocity_z` | bench 阶段 Z 轴速度指令幅值 |
 | `bench_climb_sec` / `bench_hold_sec` / `bench_descend_sec` / `bench_zero_sec` | bench 速度曲线各阶段时长 |
 | `bench_sensor_timeout` | bench 自检判断传感器消息是否新鲜的超时时间 |
