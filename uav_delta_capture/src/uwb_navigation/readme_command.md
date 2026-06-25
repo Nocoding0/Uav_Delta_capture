@@ -1,28 +1,41 @@
 # uwb_navigation 常用命令
 
-## 0. 通用准备
+## 0. Start Docker/MAVROS
+
+Use this first. It starts/fixes Docker, starts the ros2humble container, starts MAVROS, requests local_position, then runs read-only checks.
 
 ```bash
-# 清场
-docker restart ros2humble
+cd /usr/local/Uav_Delta_capture
+./start_ready.sh
+```
 
-# 启动 MAVROS，并恢复 /mavros/local_position/pose
-docker exec -d ros2humble bash -lc "/workspace/uav_delta_capture/scripts/start_mavros_with_local_position.sh > /tmp/start_mavros_with_local_position.log 2>&1"
+Success marker:
 
-# 查看飞控状态
+```text
+READY: docker, container, MAVROS checked. Log: /tmp/mlog
+```
+
+If it fails, check logs:
+
+```bash
+tail -80 /tmp/dockerd.manual.log
+docker exec ros2humble tail -100 /tmp/mlog
+```
+
+Manual read-only checks:
+
+```bash
+# FCU state
 docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && ros2 topic echo /mavros/state --once"
 
-# 查看本地位置频率
+# local_position rate
 docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && timeout 10 ros2 topic hz /mavros/local_position/pose"
 
-# 查看本地位置单帧
-docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/local_position/pose --qos-reliability best_effort --once"
+# rangefinder
+docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/rangefinder_pub sensor_msgs/msg/Range --qos-profile sensor_data --once"
 
-# 查看测距
-docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/rangefinder_pub --once"
-
-# 查看光流
-docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /mavros/optical_flow/raw/optical_flow --once"
+# optical flow
+docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && timeout 10 ros2 topic hz /mavros/optical_flow/raw/optical_flow"
 ```
 
 ## 1. 一键预检

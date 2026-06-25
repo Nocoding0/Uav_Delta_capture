@@ -9,6 +9,7 @@
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <mavros_msgs/srv/command_bool.hpp>
 #include <mavros_msgs/srv/command_long.hpp>
+#include <mavros_msgs/srv/command_tol.hpp>
 #include <mavros_msgs/srv/set_mode.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/executors/multi_threaded_executor.hpp>
@@ -78,7 +79,7 @@ public:
       mavros_arm_topic_, rmw_qos_profile_default, cb_group_);
     set_mode_client_ = create_client<mavros_msgs::srv::SetMode>(
       mavros_set_mode_topic_, rmw_qos_profile_default, cb_group_);
-    takeoff_client_ = create_client<mavros_msgs::srv::CommandLong>(
+    takeoff_client_ = create_client<mavros_msgs::srv::CommandTOL>(
       mavros_takeoff_topic_, rmw_qos_profile_default, cb_group_);
 
     // Timer for republishing velocity
@@ -283,9 +284,12 @@ private:
       return;
     }
 
-    auto req = std::make_shared<mavros_msgs::srv::CommandLong::Request>();
-    req->command = 22;  // MAV_CMD_NAV_TAKEOFF
-    req->param7 = altitude;
+    auto req = std::make_shared<mavros_msgs::srv::CommandTOL::Request>();
+    req->min_pitch = 0.0f;
+    req->yaw = 0.0f;
+    req->latitude = 0.0;
+    req->longitude = 0.0;
+    req->altitude = altitude;
 
     std::mutex mtx;
     std::condition_variable cv;
@@ -293,7 +297,7 @@ private:
 
     takeoff_client_->async_send_request(req,
       [this, altitude, response, &mtx, &cv, &done](
-        rclcpp::Client<mavros_msgs::srv::CommandLong>::SharedFuture future)
+        rclcpp::Client<mavros_msgs::srv::CommandTOL>::SharedFuture future)
       {
         auto result = future.get();
         response->success = result->success;
@@ -387,7 +391,7 @@ private:
   // MAVROS service clients
   rclcpp::Client<mavros_msgs::srv::CommandBool>::SharedPtr arm_client_;
   rclcpp::Client<mavros_msgs::srv::SetMode>::SharedPtr set_mode_client_;
-  rclcpp::Client<mavros_msgs::srv::CommandLong>::SharedPtr takeoff_client_;
+  rclcpp::Client<mavros_msgs::srv::CommandTOL>::SharedPtr takeoff_client_;
 
   // Timer
   rclcpp::TimerBase::SharedPtr vel_timer_;

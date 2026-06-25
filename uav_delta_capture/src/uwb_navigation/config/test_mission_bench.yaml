@@ -49,6 +49,8 @@ test_mission_node:
     control_rate_hz: 20.0
     low_battery_pct: 20.0
     recovery_timeout: 3.0
+    set_mode_service_timeout_sec: 8.0
+    mode_confirm_timeout_sec: 8.0
     auto_modes: GUIDED
 
     # Placeholders, unused by bench mode.

@@ -36,7 +36,7 @@ def generate_launch_description():
             package='fcu_bridge',
             executable='flight_commander_node',
             name='flight_commander_node',
-            parameters=[{'skip_ekf_check': False, 'vel_timeout_sec': 0.5}],
+            parameters=[{'skip_ekf_check': True, 'vel_timeout_sec': 0.5}],
         ),
         Node(
             package='fcu_bridge',

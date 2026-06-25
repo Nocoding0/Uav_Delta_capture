@@ -140,6 +140,12 @@ class TestMissionNode(Node):
         self.local_pose_timeout = self.declare_parameter("local_pose_timeout", 1.0).value
         self.low_battery_pct = self.declare_parameter("low_battery_pct", 20.0).value
         self.recovery_timeout = self.declare_parameter("recovery_timeout", 3.0).value
+        self.set_mode_service_timeout_sec = self.declare_parameter(
+            "set_mode_service_timeout_sec", 5.0
+        ).value
+        self.mode_confirm_timeout_sec = self.declare_parameter(
+            "mode_confirm_timeout_sec", 5.0
+        ).value
         self.auto_modes = self._parse_modes(
             self.declare_parameter("auto_modes", "GUIDED").value
         )
@@ -166,11 +172,17 @@ class TestMissionNode(Node):
         self.bench_velocity_z = clamp(abs(self.bench_velocity_z), 0.02, self.max_vel_z)
         self.grasp_timeout_sec = max(0.1, float(self.grasp_timeout_sec))
         self.drop_timeout_sec = max(0.1, float(self.drop_timeout_sec))
+        self.set_mode_service_timeout_sec = max(
+            0.5, float(self.set_mode_service_timeout_sec)
+        )
+        self.mode_confirm_timeout_sec = max(0.5, float(self.mode_confirm_timeout_sec))
 
         self.phase = Phase.INIT
         self.previous_flight_phase = Phase.INIT
         self.origin_x = 0.0
         self.origin_y = 0.0
+        self.origin_z = 0.0
+        self.origin_range = None
         self.origin_recorded = False
 
         self.hover_start_time = None
@@ -186,6 +198,12 @@ class TestMissionNode(Node):
         self._recovery_start_time = None
         self._last_preflight_event = ""
         self._last_preflight_event_time = self.get_clock().now()
+        self._pending_mode_target = None
+        self._pending_mode_next_phase = None
+        self._pending_mode_future = None
+        self._pending_mode_started = None
+        self._pending_mode_request_sent = False
+        self._pending_mode_warn_only = False
 
         self._data_lock = threading.Lock()
         self._last_uwb = None
@@ -218,6 +236,7 @@ class TestMissionNode(Node):
         self._takeoff_land_hover_ok = False
         self._takeoff_land_land_ok = False
         self._takeoff_land_result_reported = False
+        self._takeoff_wait_start_time = None
         self._shutdown_requested = False
 
         cb_group = ReentrantCallbackGroup()
@@ -313,6 +332,11 @@ class TestMissionNode(Node):
 
     def _control_loop(self):
         if self._check_critical():
+            self._publish_state()
+            return
+
+        if self._pending_mode_target is not None:
+            self._tick_pending_mode_switch()
             self._publish_state()
             return
 
@@ -455,11 +479,43 @@ class TestMissionNode(Node):
             p = self._last_local_pose.pose.position
             return (p.x, p.y)
 
+    def _get_local_z(self):
+        with self._data_lock:
+            if self._last_local_pose is None:
+                return None
+            return self._last_local_pose.pose.position.z
+
+    def _get_rangefinder_m(self):
+        with self._data_lock:
+            if self._last_rangefinder is None:
+                return None
+            value = self._last_rangefinder.range
+            if not math.isfinite(value):
+                return None
+            return value
+
+    def _get_takeoff_land_relative_altitude(self):
+        range_m = self._get_rangefinder_m()
+        if range_m is not None and self.origin_range is not None:
+            return max(0.0, range_m - self.origin_range), "rangefinder_rel"
+
+        local_z = self._get_local_z()
+        if local_z is not None:
+            return abs(local_z - self.origin_z), "local_z_rel"
+
+        return None, "missing"
+
     def _get_fcu_mode(self) -> str:
         with self._data_lock:
             if self._last_fcu_state is None:
                 return ""
             return self._last_fcu_state.mode or ""
+
+    def _armed_confirmed(self) -> bool:
+        with self._data_lock:
+            fcu_armed = bool(self._last_fcu_state and self._last_fcu_state.armed)
+            mavros_armed = bool(self._last_mavros_state and self._last_mavros_state.armed)
+            return fcu_armed or mavros_armed
 
     def _bench_snapshot(self):
         with self._data_lock:
@@ -760,12 +816,10 @@ class TestMissionNode(Node):
             self._bench_arm_ok = True
 
         if self.mission_mode == "bench_velocity":
-            self._call_mavros_set_mode("GUIDED", warn_only=True)
-            self.bench_start_time = self.get_clock().now()
-            self._transition(Phase.BENCH_VELOCITY)
+            self._start_mode_switch("GUIDED", Phase.BENCH_VELOCITY, warn_only=False)
             return
 
-        self._transition(Phase.TAKEOFF)
+        self._start_mode_switch("GUIDED", Phase.TAKEOFF, warn_only=False)
 
     def _tick_bench_velocity(self):
         if self.bench_start_time is None:
@@ -815,6 +869,26 @@ class TestMissionNode(Node):
         if self._pending_command:
             return
 
+        if not self._armed_confirmed():
+            now = self.get_clock().now()
+            if self._takeoff_wait_start_time is None:
+                self._takeoff_wait_start_time = now
+                self.get_logger().info("Waiting for armed state before TAKEOFF...")
+                return
+            elapsed = (now - self._takeoff_wait_start_time).nanoseconds / 1e9
+            if elapsed < 5.0:
+                self.get_logger().info(
+                    f"Waiting for armed state before TAKEOFF ({elapsed:.1f}s)...",
+                    throttle_duration_sec=1.0,
+                )
+                return
+            self.get_logger().error("TAKEOFF blocked: armed state was not confirmed after ARM")
+            if self.mission_mode == "takeoff_hover_land":
+                self._report_takeoff_land_result("ARM state not confirmed before TAKEOFF")
+            self._transition(Phase.FAILSAFE)
+            return
+
+        self._takeoff_wait_start_time = None
         self._record_origin()
         self._pending_command = True
         self._call_flight_cmd(
@@ -837,24 +911,45 @@ class TestMissionNode(Node):
             self._transition(Phase.FAILSAFE)
 
     def _tick_hover_takeoff(self):
-        self._publish_velocity(0.0, 0.0, 0.0)
         if self.use_mock:
+            self._publish_velocity(0.0, 0.0, 0.0)
             self._check_stable_and_transition(
                 Phase.MOVE_ABOVE, "Mock takeoff hover stable", "hover_takeoff_stable"
             )
             return
 
-        alt = self._get_fcu_altitude()
-        if abs(alt - self.takeoff_altitude) <= self.altitude_tolerance:
-            if self.mission_mode == "takeoff_hover_land":
+        if self.mission_mode == "takeoff_hover_land":
+            rel_alt, source = self._get_takeoff_land_relative_altitude()
+            if rel_alt is None:
+                self.hover_start_time = None
+                self.get_logger().warn(
+                    "Waiting for relative takeoff altitude source...",
+                    throttle_duration_sec=1.0,
+                )
+                return
+
+            target_reached = rel_alt >= max(0.0, self.takeoff_altitude - self.altitude_tolerance)
+            if target_reached:
+                self._publish_velocity(0.0, 0.0, 0.0)
                 self._check_stable_and_transition(
                     Phase.LAND,
-                    f"Takeoff-land hover stable at {alt:.2f}m",
+                    f"Takeoff-land hover stable at rel_alt={rel_alt:.2f}m ({source})",
                     "takeoff_land_hover_stable",
                 )
                 if self.phase == Phase.LAND:
                     self._takeoff_land_hover_ok = True
                 return
+
+            self.hover_start_time = None
+            self.get_logger().info(
+                f"Waiting for takeoff height: rel_alt={rel_alt:.2f}/{self.takeoff_altitude:.2f}m ({source})",
+                throttle_duration_sec=1.0,
+            )
+            return
+
+        self._publish_velocity(0.0, 0.0, 0.0)
+        alt = self._get_fcu_altitude()
+        if abs(alt - self.takeoff_altitude) <= self.altitude_tolerance:
             self._check_stable_and_transition(
                 Phase.MOVE_ABOVE, f"Takeoff altitude stable at {alt:.2f}m", "hover_takeoff_stable"
             )
@@ -1160,8 +1255,16 @@ class TestMissionNode(Node):
         if pos is not None:
             self.origin_x = pos[0]
             self.origin_y = pos[1]
+        local_z = self._get_local_z()
+        if local_z is not None:
+            self.origin_z = local_z
+        self.origin_range = self._get_rangefinder_m()
         self.origin_recorded = True
-        self.get_logger().info(f"Origin recorded: ({self.origin_x:.2f}, {self.origin_y:.2f})")
+        range_text = "none" if self.origin_range is None else f"{self.origin_range:.2f}"
+        self.get_logger().info(
+            f"Origin recorded: ({self.origin_x:.2f}, {self.origin_y:.2f}) "
+            f"z={self.origin_z:.2f} range={range_text}"
+        )
 
     def _check_stable_and_transition(self, next_phase: Phase, log_msg: str, event: str):
         now = self.get_clock().now()
@@ -1186,6 +1289,8 @@ class TestMissionNode(Node):
             self.grasp_start_time = None
         if new_phase != Phase.WAIT_DROP:
             self.drop_start_time = None
+        if new_phase != Phase.TAKEOFF:
+            self._takeoff_wait_start_time = None
 
     def _publish_velocity(self, vx: float, vy: float, vz: float):
         now = self.get_clock().now()
@@ -1274,7 +1379,9 @@ class TestMissionNode(Node):
     def _call_mavros_set_mode(self, mode_str: str, warn_only: bool = False):
         if self.use_mock:
             return
-        if not self.mavros_set_mode_client.wait_for_service(timeout_sec=2.0):
+        if not self.mavros_set_mode_client.wait_for_service(
+            timeout_sec=self.set_mode_service_timeout_sec
+        ):
             if self.mission_mode == "bench_velocity" and mode_str == "GUIDED":
                 self._bench_guided_ok = False
             log = self.get_logger().warn if warn_only else self.get_logger().error
@@ -1297,6 +1404,114 @@ class TestMissionNode(Node):
                 log(f"SetMode failed: {exc}")
 
         future.add_done_callback(done)
+
+    def _start_mode_switch(self, mode_str: str, next_phase: Phase, warn_only: bool = False):
+        if self.use_mock:
+            self._transition(next_phase)
+            return
+
+        self._pending_mode_target = mode_str
+        self._pending_mode_next_phase = next_phase
+        self._pending_mode_future = None
+        self._pending_mode_started = self.get_clock().now()
+        self._pending_mode_request_sent = False
+        self._pending_mode_warn_only = warn_only
+        self.get_logger().info(
+            f"Requesting FCU mode {mode_str} before {PHASE_NAMES[next_phase]}"
+        )
+
+    def _tick_pending_mode_switch(self):
+        target = self._pending_mode_target
+        next_phase = self._pending_mode_next_phase
+        now = self.get_clock().now()
+        elapsed = (now - self._pending_mode_started).nanoseconds / 1e9
+
+        if self._get_fcu_mode() == target:
+            self.get_logger().info(f"FCU mode confirmed: {target}")
+            if self.mission_mode == "bench_velocity" and target == "GUIDED":
+                self._bench_guided_ok = True
+            self._clear_pending_mode_switch()
+            if next_phase == Phase.BENCH_VELOCITY:
+                self.bench_start_time = self.get_clock().now()
+            self._transition(next_phase)
+            return
+
+        if not self._pending_mode_request_sent:
+            if not self.mavros_set_mode_client.service_is_ready():
+                if elapsed >= self.set_mode_service_timeout_sec:
+                    self._finish_mode_switch_failure(
+                        f"MAVROS set_mode service not ready after {elapsed:.1f}s"
+                    )
+                else:
+                    self.get_logger().warn(
+                        f"Waiting for MAVROS set_mode service before {target}...",
+                        throttle_duration_sec=1.0,
+                    )
+                return
+
+            req = SetMode.Request()
+            req.custom_mode = target
+            self._pending_mode_future = self.mavros_set_mode_client.call_async(req)
+            self._pending_mode_request_sent = True
+            self.get_logger().info(f"MAVROS SetMode({target}) request sent")
+            return
+
+        if self._pending_mode_future is not None and self._pending_mode_future.done():
+            try:
+                result = self._pending_mode_future.result()
+                if not result.mode_sent:
+                    self._finish_mode_switch_failure(
+                        f"MAVROS SetMode({target}) rejected: mode_sent=False"
+                    )
+                    return
+                self.get_logger().info(
+                    f"MAVROS SetMode({target}) accepted, waiting for FCU state"
+                )
+                self._pending_mode_future = None
+            except Exception as exc:
+                self._finish_mode_switch_failure(f"SetMode({target}) failed: {exc}")
+                return
+
+        if elapsed >= self.mode_confirm_timeout_sec:
+            self._finish_mode_switch_failure(
+                f"FCU mode did not become {target} within {elapsed:.1f}s "
+                f"(current={self._get_fcu_mode() or '-'})"
+            )
+
+    def _clear_pending_mode_switch(self):
+        self._pending_mode_target = None
+        self._pending_mode_next_phase = None
+        self._pending_mode_future = None
+        self._pending_mode_started = None
+        self._pending_mode_request_sent = False
+        self._pending_mode_warn_only = False
+
+    def _finish_mode_switch_failure(self, reason: str):
+        target = self._pending_mode_target
+        warn_only = self._pending_mode_warn_only
+        self._clear_pending_mode_switch()
+        if self.mission_mode == "bench_velocity" and target == "GUIDED":
+            self._bench_guided_ok = False
+        log = self.get_logger().warn if warn_only else self.get_logger().error
+        log(reason)
+        self._publish_event(f"mode_switch_failed:{target}")
+
+        if self.mission_mode == "bench_velocity":
+            self._publish_velocity(0.0, 0.0, 0.0)
+            self._report_bench_result(reason)
+            if not self._desktop_disarm_done and not self._pending_command:
+                self._pending_command = True
+                self._call_flight_cmd(
+                    FlightCommand.Request.CMD_DISARM, 0.0, self._on_bench_disarm
+                )
+            else:
+                self._transition(Phase.FAILSAFE)
+            return
+
+        self._publish_velocity(0.0, 0.0, 0.0)
+        if self.mission_mode == "takeoff_hover_land":
+            self._report_takeoff_land_result(reason)
+        self._transition(Phase.FAILSAFE)
 
 
 def main(args=None):
