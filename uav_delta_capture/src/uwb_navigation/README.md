@@ -36,6 +36,7 @@ source /workspace/uav_delta_capture/install/setup.bash
 |---|---|---|---|---|
 | `mock_full` | `test_mission.launch.py` | `test_mission_mock.yaml` | 否 | 全软件状态机和 ROS 链路测试 |
 | `bench_velocity` | `test_mission_bench.launch.py` | `test_mission_bench.yaml` | FCU 必需，UWB/测距/光流/本地位置仅监测 | 不上桨叶，ARM 后发送 Z 轴速度曲线再 DISARM |
+| `takeoff_forward_land` | `test_mission_takeoff_forward_land.launch.py` | `test_mission_takeoff_forward_land.yaml` | FCU、测距、光流、本地位置 | 低高度 GUIDED 起飞、按起飞时机头方向移动约 0.60m、悬停、降落 |
 | `uwb_approach_land` | `test_mission_uwb_approach_land.launch.py` | `test_mission_uwb_approach_land.yaml` | 完整硬件 | 低高度 GUIDED 起飞、UWB 接近 tag 上方、悬停、原地降落 |
 | `real_full` | `test_mission_real_full.launch.py` | `test_mission_real.yaml` | 完整硬件 | 完整起飞、UWB 接近、下降、抓取占位、返航、投放占位、降落 |
 
@@ -444,9 +445,11 @@ Core links: ARM=OK TAKEOFF=OK HOVER=OK LAND=OK
 Sensor links: FCU=OK ... RC=OK ... rangefinder=OK ... optical_flow=OK local_pose=OK set_mode_srv=OK
 ```
 
-通过后再进入小范围 GUIDED 速度闭环测试，然后跑 `uwb_approach_land`，最后才跑低高度短距离 `real_full`。
+通过后再进入小范围 GUIDED 定位前进测试，然后跑 `uwb_approach_land`，最后才跑低高度短距离 `real_full`。
 
 LOITER 对比测试使用 `test_mission_takeoff_loiter_land.launch.py`。它沿用简单起降的 MAVROS takeoff 逻辑，到达目标相对高度后先在 `GUIDED` 稳定约 1.5 秒，再切 `LOITER` 悬停，随后切回 `GUIDED` 执行 `LAND`。这个测试用于比较飞控 `LOITER` 定点保持效果，不验证 UWB 接近。
+
+GUIDED 定位前进测试使用 `test_mission_takeoff_forward_land.launch.py`。它沿用简单起降的 MAVROS takeoff 逻辑，到达低高度后保持 `GUIDED`，先把 MAVROS `setpoint_velocity` 的 `mav_frame` 切到 `BODY_NED`，再发送机体系 X 正方向小速度，并用 `/mavros/local_position/pose` 的水平位移达到约 `0.60m` 作为停止条件；随后悬停约 2 秒并 `LAND`。这个测试不依赖 UWB，适合 UWB 串口暂不可用时先验证飞控本地位置和短距离速度控制。
 
 UWB 接近降落精简测试使用 `test_mission_uwb_approach_land.launch.py`。它沿用简单起降的 MAVROS takeoff 逻辑，到达低高度后保持 `GUIDED`，使用 UWB 方位和距离低速移动到 tag 上方，悬停确认后直接 `LAND`。这个测试不做抓取、复飞、返航、投放，是 `real_full` 前的上桨过渡入口。
 
@@ -677,7 +680,7 @@ docker restart ros2humble
 
 | 参数 | 说明 |
 |---|---|
-| `mission_mode` | `mock_full`、`bench_velocity`、`takeoff_hover_land`、`uwb_approach_land` 或 `real_full` |
+| `mission_mode` | `mock_full`、`bench_velocity`、`takeoff_hover_land`、`takeoff_forward_land`、`uwb_approach_land` 或 `real_full` |
 | `require_uwb_ready` | `INIT` 阶段是否等待 UWB 数据有效 |
 | `require_local_pose_ready` | `INIT` 阶段是否等待本地位置有效 |
 | `takeoff_altitude` | 起飞和返航阶段使用的固定高度 |
@@ -685,6 +688,10 @@ docker restart ros2humble
 | `max_vel_xy` | 水平最大速度 |
 | `max_vel_z` | 垂直最大速度 |
 | `velocity_slew_rate` | 速度变化限幅，用于平滑指令 |
+| `forward_target_distance` | `takeoff_forward_land` 前进阶段目标 local_position 水平位移 |
+| `forward_velocity` | `takeoff_forward_land` 前进阶段机体系 X 正方向速度，要求 MAVROS `mav_frame=BODY_NED` |
+| `forward_timeout_sec` | `takeoff_forward_land` 前进阶段最长持续时间，超时后进入安全降落 |
+| `target_hover_time` | `takeoff_forward_land` 到达目标位移后的悬停时间 |
 | `move_above_timeout_sec` | UWB 接近阶段最长持续时间，超时后进入安全降落 |
 | `uwb_missing_timeout_sec` | UWB 接近阶段允许 UWB 数据连续丢失的最长时间 |
 | `bench_velocity_z` | bench 阶段 Z 轴速度指令幅值 |

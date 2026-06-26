@@ -137,6 +137,45 @@ Landing complete
 TAKEOFF_LOITER_LAND RESULT: PASS
 ```
 
+### 4.2 上桨 GUIDED 定位前进降落测试
+
+用途：UWB 暂不可用时，先验证飞控本地位置 `/mavros/local_position/pose` 是否能支持短距离自主位移。流程是 `GUIDED` takeoff 起飞，到 `0.6m` 相对高度后先悬停稳定，再把 MAVROS setpoint velocity 切到 `BODY_NED`，按机体系 X 正方向低速前进；前进停止条件不是固定时间，而是 local_position 水平位移达到约 `0.60m`，随后在前方点悬停 2 秒并自动 `LAND`。
+
+前置：简单起降已 PASS，`/mavros/local_position/pose`、测距、光流均为 OK。该模式不启动 UWB driver，不读取 `/dev/ttySTM1`，不要求 `UWB=OK`。
+
+飞行前建议确认 MAVROS 速度坐标系已经被 launch 切成机体系：
+
+```bash
+docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && ros2 param get /mavros/setpoint_velocity mav_frame"
+```
+
+期望输出：
+
+```text
+String value is: BODY_NED
+```
+
+```bash
+docker exec -it ros2humble bash -lc "
+  source /opt/ros/humble/setup.bash
+  source /workspace/uav_delta_capture/install/setup.bash
+  ros2 launch uwb_navigation test_mission_takeoff_forward_land.launch.py
+"
+```
+
+关键通过标志：
+
+```text
+Takeoff OK
+Phase: HOVER_TAKEOFF -> FORWARD
+Forward moving:
+Forward target reached
+Forward target hover stable, landing
+TAKEOFF_FORWARD_LAND RESULT: PASS
+```
+
+如果 `FORWARD timeout`，说明 local_position 位移没有按预期增长，先检查光流、测距、EKF 和地面纹理，不要加大速度硬飞。日志里的 `cmd_body=(0.12,0.00,...)` 表示机体系前向速度；如果仍然不随机头方向飞，先确认 `mav_frame` 是否仍是 `BODY_NED`。
+
 ## 5. 上桨 UWB 接近降落精简测试
 
 用途：在简单 GUIDED 起降通过后，先验证“起飞、UWB 接近 tag 正上方、悬停、原地降落”。这个模式不做抓取、复飞、返航、投放，是完整任务前的上桨精简版本。
@@ -179,4 +218,7 @@ docker exec ros2humble bash -lc "grep -E 'Takeoff-land preflight|TAKEOFF_LAND RE
 
 # UWB 接近降落精简任务后台日志
 docker exec ros2humble bash -lc "grep -E 'UWB approach-land preflight|UWB_APPROACH_LAND RESULT|Core links|Sensor links|Phase|Takeoff OK|UWB approach|Above target|Landing complete|LAND_WAIT|FAILSAFE|ERROR|WARN' /tmp/mission_uwb_approach_land.log | tail -180"
+
+# GUIDED 定位前进降落后台日志
+docker exec ros2humble bash -lc "grep -E 'Takeoff-forward-land preflight|TAKEOFF_FORWARD_LAND RESULT|Core links|Sensor links|Phase|Takeoff OK|Forward moving|Forward target|Landing complete|LAND_WAIT|FAILSAFE|ERROR|WARN' /tmp/mission_takeoff_forward_land.log | tail -180"
 ```

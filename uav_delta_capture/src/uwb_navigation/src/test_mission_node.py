@@ -5,6 +5,7 @@ Mission modes:
   - mock_full: pure software flow test.
   - bench_velocity: real hardware preflight + ARM + short Z velocity profile + DISARM.
   - takeoff_loiter_land: climb gently in GUIDED, hover in LOITER, switch back to GUIDED, land.
+  - takeoff_forward_land: low GUIDED takeoff, body-forward local-position move, hover, land.
   - uwb_approach_land: low GUIDED takeoff, UWB approach to tag, hover, land.
   - real_full: take off, UWB approach, descend, fake/real grasp, climb, return, drop, land.
 """
@@ -57,6 +58,8 @@ class Phase(Enum):
     FAILSAFE = 19
     HOVER_LOITER = 20
     LAND_WAIT = 21
+    FORWARD = 22
+    HOVER_FORWARD = 23
 
 
 PHASE_NAMES = {phase: phase.name for phase in Phase}
@@ -167,6 +170,14 @@ class TestMissionNode(Node):
         self.uwb_missing_timeout_sec = self.declare_parameter(
             "uwb_missing_timeout_sec", 3.0
         ).value
+        self.forward_target_distance = self.declare_parameter(
+            "forward_target_distance", 0.3
+        ).value
+        self.forward_velocity = self.declare_parameter("forward_velocity", 0.12).value
+        self.forward_timeout_sec = self.declare_parameter(
+            "forward_timeout_sec", 8.0
+        ).value
+        self.target_hover_time = self.declare_parameter("target_hover_time", 2.0).value
 
         self.require_uwb_ready = self.declare_parameter("require_uwb_ready", True).value
         self.require_local_pose_ready = self.declare_parameter("require_local_pose_ready", True).value
@@ -228,6 +239,10 @@ class TestMissionNode(Node):
         self.mode_confirm_timeout_sec = max(0.5, float(self.mode_confirm_timeout_sec))
         self.move_above_timeout_sec = max(1.0, float(self.move_above_timeout_sec))
         self.uwb_missing_timeout_sec = max(0.2, float(self.uwb_missing_timeout_sec))
+        self.forward_target_distance = max(0.05, float(self.forward_target_distance))
+        self.forward_velocity = clamp(abs(float(self.forward_velocity)), 0.03, self.max_vel_xy)
+        self.forward_timeout_sec = max(1.0, float(self.forward_timeout_sec))
+        self.target_hover_time = max(0.2, float(self.target_hover_time))
 
         self.phase = Phase.INIT
         self.previous_flight_phase = Phase.INIT
@@ -289,6 +304,7 @@ class TestMissionNode(Node):
         self._takeoff_land_land_ok = False
         self._takeoff_land_loiter_ok = False
         self._takeoff_land_guided_return_ok = False
+        self._takeoff_land_forward_ok = False
         self._uwb_approach_ok = False
         self._takeoff_land_result_reported = False
         self._takeoff_land_abort_reason = None
@@ -298,9 +314,13 @@ class TestMissionNode(Node):
         self._loiter_alt_loss_start_time = None
         self._move_above_start_time = None
         self._uwb_missing_start_time = None
+        self._forward_start_time = None
+        self._forward_start_xy = None
         self._land_wait_start_time = None
         self._land_ground_start_time = None
         self._land_disarm_sent = False
+        self._land_disarm_retry_count = 0
+        self._land_disarm_retry_time = None
         self._shutdown_requested = False
 
         cb_group = ReentrantCallbackGroup()
@@ -429,6 +449,8 @@ class TestMissionNode(Node):
             Phase.RECOVERING: self._tick_recovering,
             Phase.FAILSAFE: self._tick_failsafe,
             Phase.HOVER_LOITER: self._tick_hover_loiter,
+            Phase.FORWARD: self._tick_forward,
+            Phase.HOVER_FORWARD: self._tick_hover_forward,
         }
         tick_map[self.phase]()
         self._publish_state()
@@ -744,11 +766,15 @@ class TestMissionNode(Node):
         return self.mission_mode in (
             "takeoff_hover_land",
             "takeoff_loiter_land",
+            "takeoff_forward_land",
             "uwb_approach_land",
         )
 
     def _is_takeoff_loiter_land_mode(self) -> bool:
         return self.mission_mode == "takeoff_loiter_land"
+
+    def _is_takeoff_forward_land_mode(self) -> bool:
+        return self.mission_mode == "takeoff_forward_land"
 
     def _is_uwb_approach_land_mode(self) -> bool:
         return self.mission_mode == "uwb_approach_land"
@@ -756,6 +782,8 @@ class TestMissionNode(Node):
     def _takeoff_land_label(self) -> str:
         if self._is_takeoff_loiter_land_mode():
             return "TAKEOFF_LOITER_LAND"
+        if self._is_takeoff_forward_land_mode():
+            return "TAKEOFF_FORWARD_LAND"
         if self._is_uwb_approach_land_mode():
             return "UWB_APPROACH_LAND"
         return "TAKEOFF_LAND"
@@ -763,6 +791,8 @@ class TestMissionNode(Node):
     def _takeoff_land_text(self) -> str:
         if self._is_takeoff_loiter_land_mode():
             return "Takeoff-loiter-land"
+        if self._is_takeoff_forward_land_mode():
+            return "Takeoff-forward-land"
         if self._is_uwb_approach_land_mode():
             return "UWB approach-land"
         return "Takeoff-land"
@@ -785,6 +815,8 @@ class TestMissionNode(Node):
                 and self._takeoff_land_loiter_ok
                 and self._takeoff_land_guided_return_ok
             )
+        if self._is_takeoff_forward_land_mode():
+            core_ok = core_ok and self._takeoff_land_forward_ok
         if self._is_uwb_approach_land_mode():
             core_ok = core_ok and self._uwb_approach_ok
         sensor_ok = (
@@ -824,6 +856,15 @@ class TestMissionNode(Node):
                 f"TAKEOFF={'OK' if self._takeoff_land_takeoff_ok else 'FAIL'} "
                 f"HOVER={'OK' if self._takeoff_land_hover_ok else 'FAIL'} "
                 f"UWB_APPROACH={'OK' if self._uwb_approach_ok else 'FAIL'} "
+                f"LAND={'OK' if self._takeoff_land_land_ok else 'FAIL'}"
+            )
+        elif self._is_takeoff_forward_land_mode():
+            core_text = (
+                "Core links: "
+                f"ARM={'OK' if self._bench_arm_ok else 'FAIL'} "
+                f"TAKEOFF={'OK' if self._takeoff_land_takeoff_ok else 'FAIL'} "
+                f"HOVER={'OK' if self._takeoff_land_hover_ok else 'FAIL'} "
+                f"FORWARD={'OK' if self._takeoff_land_forward_ok else 'FAIL'} "
                 f"LAND={'OK' if self._takeoff_land_land_ok else 'FAIL'}"
             )
         else:
@@ -1140,6 +1181,15 @@ class TestMissionNode(Node):
                     if self.phase == Phase.MOVE_ABOVE:
                         self._takeoff_land_hover_ok = True
                     return
+                if self._is_takeoff_forward_land_mode():
+                    self._check_stable_and_transition(
+                        Phase.FORWARD,
+                        f"Takeoff-forward hover stable at rel_alt={rel_alt:.2f}m ({source}), starting forward move",
+                        "takeoff_forward_hover_stable",
+                    )
+                    if self.phase == Phase.FORWARD:
+                        self._takeoff_land_hover_ok = True
+                    return
                 self._check_stable_and_transition(
                     Phase.LAND,
                     f"Takeoff-land hover stable at rel_alt={rel_alt:.2f}m ({source})",
@@ -1189,6 +1239,93 @@ class TestMissionNode(Node):
             )
         else:
             self.hover_start_time = None
+
+    def _tick_forward(self):
+        if self.use_mock:
+            self.get_logger().info("Mock FORWARD complete")
+            self._takeoff_land_forward_ok = True
+            self._transition(Phase.HOVER_FORWARD)
+            return
+
+        now = self.get_clock().now()
+        pos = self._get_local_xy()
+        if pos is None:
+            self._publish_velocity(0.0, 0.0, 0.0)
+            reason = "No local pose during forward move"
+            self.get_logger().error(reason)
+            self._takeoff_land_abort_reason = reason
+            self._transition(Phase.FAILSAFE)
+            return
+
+        if self._forward_start_time is None or self._forward_start_xy is None:
+            self._forward_start_time = now
+            self._forward_start_xy = pos
+            self.get_logger().info(
+                f"Forward move started from ({pos[0]:.2f}, {pos[1]:.2f}); "
+                f"target={self.forward_target_distance:.2f}m "
+                f"cmd_body_x={self.forward_velocity:.2f}m/s"
+            )
+
+        dx = pos[0] - self._forward_start_xy[0]
+        dy = pos[1] - self._forward_start_xy[1]
+        dist = math.sqrt(dx * dx + dy * dy)
+        elapsed = (now - self._forward_start_time).nanoseconds / 1e9
+
+        if dist >= self.forward_target_distance:
+            self._publish_velocity(0.0, 0.0, 0.0)
+            self._takeoff_land_forward_ok = True
+            self.get_logger().info(
+                f"Forward target reached: d={dist:.2f}/"
+                f"{self.forward_target_distance:.2f}m, hovering before LAND"
+            )
+            self._publish_event("forward_target_reached")
+            self._transition(Phase.HOVER_FORWARD)
+            return
+
+        if elapsed >= self.forward_timeout_sec:
+            self._publish_velocity(0.0, 0.0, 0.0)
+            reason = (
+                f"FORWARD timeout: d={dist:.2f}/"
+                f"{self.forward_target_distance:.2f}m after {elapsed:.1f}s"
+            )
+            self.get_logger().error(reason)
+            self._takeoff_land_abort_reason = reason
+            self._transition(Phase.FAILSAFE)
+            return
+
+        rel_alt, source = self._get_takeoff_land_relative_altitude()
+        vz = 0.0
+        if rel_alt is not None:
+            alt_err = self.takeoff_altitude - rel_alt
+            vz = clamp(self.kp_vertical * alt_err, -self.max_vel_z, self.max_vel_z)
+        self._publish_velocity(self.forward_velocity, 0.0, vz, frame_id="body")
+        alt_text = "missing" if rel_alt is None else f"{rel_alt:.2f}m ({source})"
+        self.get_logger().info(
+            f"Forward moving: d={dist:.2f}/{self.forward_target_distance:.2f}m "
+            f"elapsed={elapsed:.1f}/{self.forward_timeout_sec:.1f}s "
+            f"rel_alt={alt_text} cmd_body=({self.forward_velocity:.2f},0.00,{vz:.2f})",
+            throttle_duration_sec=1.0,
+        )
+
+    def _tick_hover_forward(self):
+        self._publish_velocity(0.0, 0.0, 0.0)
+        now = self.get_clock().now()
+        if self.hover_start_time is None:
+            self.hover_start_time = now
+            self.get_logger().info(
+                f"Forward target hover started, holding {self.target_hover_time:.1f}s before LAND"
+            )
+            return
+        elapsed = (now - self.hover_start_time).nanoseconds / 1e9
+        if elapsed >= self.target_hover_time:
+            self.get_logger().info("Forward target hover stable, landing")
+            self._publish_event("forward_hover_done")
+            self._transition(Phase.LAND)
+            return
+        self.get_logger().info(
+            f"Forward target hover holding {elapsed:.1f}/{self.target_hover_time:.1f}s",
+            throttle_duration_sec=1.0,
+        )
 
     def _tick_hover_loiter(self):
         self._publish_velocity(0.0, 0.0, 0.0)
@@ -1555,6 +1692,7 @@ class TestMissionNode(Node):
             self._land_wait_start_time = now
             self._land_ground_start_time = None
             self._land_disarm_sent = False
+            self._land_disarm_retry_count = 0
 
         rel_alt, source = self._get_takeoff_land_relative_altitude()
         alt_text = "rel_alt=missing"
@@ -1580,6 +1718,14 @@ class TestMissionNode(Node):
                 if self._pending_command:
                     return
                 if not self._land_disarm_sent:
+                    if self._land_disarm_retry_time is not None:
+                        retry_elapsed = (now - self._land_disarm_retry_time).nanoseconds / 1e9
+                        if retry_elapsed < 1.0:
+                            self.get_logger().info(
+                                f"Landing DISARM retry wait {retry_elapsed:.1f}/1.0s at {alt_text}",
+                                throttle_duration_sec=0.5,
+                            )
+                            return
                     self._land_disarm_sent = True
                     self._pending_command = True
                     self.get_logger().info(
@@ -1618,7 +1764,16 @@ class TestMissionNode(Node):
             self.get_logger().info(f"Landing DISARM: {'OK' if success else 'already disarmed'} - {msg}")
             self._finish_landing_success()
             return
-        reason = f"Landing DISARM failed: {msg}"
+        self._land_disarm_retry_count += 1
+        if self._land_disarm_retry_count <= 3:
+            self._land_disarm_sent = False
+            self._land_disarm_retry_time = self.get_clock().now()
+            self.get_logger().warn(
+                f"Landing DISARM rejected ({self._land_disarm_retry_count}/3): {msg}; "
+                "waiting and retrying"
+            )
+            return
+        reason = f"Landing DISARM failed after retries: {msg}"
         self.get_logger().error(reason)
         if self._is_takeoff_land_mode():
             self._report_takeoff_land_result(reason)
@@ -1751,12 +1906,17 @@ class TestMissionNode(Node):
         if new_phase != Phase.MOVE_ABOVE:
             self._move_above_start_time = None
             self._uwb_missing_start_time = None
+        if new_phase != Phase.FORWARD:
+            self._forward_start_time = None
+            self._forward_start_xy = None
         if new_phase != Phase.LAND_WAIT:
             self._land_wait_start_time = None
             self._land_ground_start_time = None
             self._land_disarm_sent = False
+            self._land_disarm_retry_count = 0
+            self._land_disarm_retry_time = None
 
-    def _publish_velocity(self, vx: float, vy: float, vz: float):
+    def _publish_velocity(self, vx: float, vy: float, vz: float, frame_id: str = "body"):
         now = self.get_clock().now()
         dt = max((now - self._last_velocity_time).nanoseconds / 1e9, 1.0 / max(self.control_rate_hz, 1.0))
         max_delta = self.velocity_slew_rate * dt
@@ -1767,7 +1927,7 @@ class TestMissionNode(Node):
 
         msg = TwistStamped()
         msg.header.stamp = now.to_msg()
-        msg.header.frame_id = "body"
+        msg.header.frame_id = frame_id
         msg.twist.linear.x = vx
         msg.twist.linear.y = vy
         msg.twist.linear.z = vz
