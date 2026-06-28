@@ -179,6 +179,21 @@ class TestMissionNode(Node):
         self.uwb_target_hover_time_sec = self.declare_parameter(
             "uwb_target_hover_time_sec", 0.8
         ).value
+        self.uwb_approach_front_sector_deg = self.declare_parameter(
+            "uwb_approach_front_sector_deg", 65.0
+        ).value
+        self.uwb_capture_front_sector_deg = self.declare_parameter(
+            "uwb_capture_front_sector_deg", 55.0
+        ).value
+        self.uwb_front_sector_timeout_sec = self.declare_parameter(
+            "uwb_front_sector_timeout_sec", 2.0
+        ).value
+        self.uwb_capture_stable_sec = self.declare_parameter(
+            "uwb_capture_stable_sec", 0.3
+        ).value
+        self.uwb_out_of_front_action = self.declare_parameter(
+            "uwb_out_of_front_action", "LAND"
+        ).value
         self.mission_soft_radius_m = self.declare_parameter("mission_soft_radius_m", 2.0).value
         self.mission_hard_radius_m = self.declare_parameter("mission_hard_radius_m", 2.5).value
         self.altitude_tolerance = self.declare_parameter("altitude_tolerance", 0.15).value
@@ -281,6 +296,17 @@ class TestMissionNode(Node):
             abs(float(self.uwb_slow_max_vel_xy)), 0.02, self.max_vel_xy
         )
         self.uwb_target_hover_time_sec = max(0.1, float(self.uwb_target_hover_time_sec))
+        self.uwb_approach_front_sector_deg = clamp(
+            abs(float(self.uwb_approach_front_sector_deg)), 5.0, 179.0
+        )
+        self.uwb_capture_front_sector_deg = clamp(
+            abs(float(self.uwb_capture_front_sector_deg)), 3.0, self.uwb_approach_front_sector_deg
+        )
+        self.uwb_front_sector_timeout_sec = max(0.2, float(self.uwb_front_sector_timeout_sec))
+        self.uwb_capture_stable_sec = max(0.0, float(self.uwb_capture_stable_sec))
+        self.uwb_out_of_front_action = str(self.uwb_out_of_front_action).strip().upper()
+        if self.uwb_out_of_front_action not in ("LAND", "HOVER"):
+            self.uwb_out_of_front_action = "LAND"
         self.mission_soft_radius_m = max(0.1, float(self.mission_soft_radius_m))
         self.mission_hard_radius_m = max(self.mission_soft_radius_m, float(self.mission_hard_radius_m))
         self.forward_target_distance = max(0.05, float(self.forward_target_distance))
@@ -374,6 +400,8 @@ class TestMissionNode(Node):
         self._loiter_alt_loss_start_time = None
         self._move_above_start_time = None
         self._uwb_missing_start_time = None
+        self._uwb_out_of_front_start_time = None
+        self._uwb_capture_start_time = None
         self._uwb_target_captured = False
         self._forward_start_time = None
         self._forward_start_xy = None
@@ -1928,18 +1956,68 @@ class TestMissionNode(Node):
         vz = clamp(self.kp_vertical * alt_err, -self.max_vel_z, self.max_vel_z)
 
         radius = self._mission_xy_distance_from_origin()
-        if self._is_uwb_approach_land_mode() and horizontal_dist <= self.uwb_capture_radius_m:
-            self._uwb_target_captured = True
-            self._uwb_approach_ok = True
-            self._publish_velocity(0.0, 0.0, vz, frame_id="body", immediate=True)
-            self._publish_event("uwb_target_captured")
-            self.get_logger().info(
-                f"UWB target captured: az={azimuth:.1f}deg raw_az={raw_azimuth:.1f}deg "
-                f"el={elevation:.1f}deg hdist={horizontal_dist:.2f}/"
-                f"{self.uwb_capture_radius_m:.2f}m body_dist=({forward_dist:.2f},{lateral_dist:.2f})"
+        if self._is_uwb_approach_land_mode():
+            front_ok = abs(azimuth) <= self.uwb_approach_front_sector_deg
+            capture_geometry_ok = (
+                horizontal_dist <= self.uwb_capture_radius_m
+                and abs(azimuth) <= self.uwb_capture_front_sector_deg
             )
-            self._transition(Phase.HOVER_ABOVE)
-            return
+            if not front_ok:
+                self._uwb_capture_start_time = None
+                if self._uwb_out_of_front_start_time is None:
+                    self._uwb_out_of_front_start_time = now
+                out_elapsed = (now - self._uwb_out_of_front_start_time).nanoseconds / 1e9
+                self._publish_velocity(0.0, 0.0, vz, frame_id="body", immediate=True)
+                self.get_logger().warn(
+                    f"UWB target outside front sector: az={azimuth:.1f}deg "
+                    f"raw_az={raw_azimuth:.1f}deg limit={self.uwb_approach_front_sector_deg:.1f}deg "
+                    f"hdist={horizontal_dist:.2f}m elapsed={out_elapsed:.1f}/"
+                    f"{self.uwb_front_sector_timeout_sec:.1f}s action={self.uwb_out_of_front_action}",
+                    throttle_duration_sec=0.5,
+                )
+                if (
+                    out_elapsed >= self.uwb_front_sector_timeout_sec
+                    and self.uwb_out_of_front_action == "LAND"
+                ):
+                    reason = (
+                        f"UWB target outside front sector for {out_elapsed:.1f}s "
+                        f"(az={azimuth:.1f}deg, limit={self.uwb_approach_front_sector_deg:.1f}deg)"
+                    )
+                    self.get_logger().warn(f"{reason}; landing")
+                    self._publish_event("uwb_out_of_front_land")
+                    self._takeoff_land_abort_reason = reason
+                    self._transition(Phase.LAND)
+                return
+
+            self._uwb_out_of_front_start_time = None
+            if capture_geometry_ok:
+                if self._uwb_capture_start_time is None:
+                    self._uwb_capture_start_time = now
+                    capture_elapsed = 0.0
+                else:
+                    capture_elapsed = (now - self._uwb_capture_start_time).nanoseconds / 1e9
+                self._publish_velocity(0.0, 0.0, vz, frame_id="body", immediate=True)
+                if capture_elapsed < self.uwb_capture_stable_sec:
+                    self.get_logger().info(
+                        f"UWB target capture candidate: az={azimuth:.1f}deg "
+                        f"raw_az={raw_azimuth:.1f}deg el={elevation:.1f}deg "
+                        f"hdist={horizontal_dist:.2f}/{self.uwb_capture_radius_m:.2f}m "
+                        f"stable={capture_elapsed:.1f}/{self.uwb_capture_stable_sec:.1f}s",
+                        throttle_duration_sec=0.2,
+                    )
+                    return
+                self._uwb_target_captured = True
+                self._uwb_approach_ok = True
+                self._publish_event("uwb_target_captured")
+                self.get_logger().info(
+                    f"UWB target captured: az={azimuth:.1f}deg raw_az={raw_azimuth:.1f}deg "
+                    f"el={elevation:.1f}deg hdist={horizontal_dist:.2f}/"
+                    f"{self.uwb_capture_radius_m:.2f}m body_dist=({forward_dist:.2f},{lateral_dist:.2f}) "
+                    f"stable={capture_elapsed:.1f}s"
+                )
+                self._transition(Phase.HOVER_ABOVE)
+                return
+            self._uwb_capture_start_time = None
 
         if (
             self._is_uwb_approach_land_mode()
@@ -1973,7 +2051,9 @@ class TestMissionNode(Node):
                 f"el={elevation:.1f}deg hdist={horizontal_dist:.2f}m "
                 f"body_dist=({forward_dist:.2f},{lateral_dist:.2f}) "
                 f"rel_alt={alt_text} ({alt_source}) "
-                f"cmd_body=({vx:.2f},{vy:.2f},{vz:.2f}) speed_limit={speed_limit:.2f}",
+                f"cmd_body=({vx:.2f},{vy:.2f},{vz:.2f}) speed_limit={speed_limit:.2f} "
+                f"front_limit={self.uwb_approach_front_sector_deg:.1f}deg "
+                f"capture_limit={self.uwb_capture_front_sector_deg:.1f}deg",
                 throttle_duration_sec=1.0,
             )
 
@@ -2428,6 +2508,8 @@ class TestMissionNode(Node):
         if new_phase != Phase.MOVE_ABOVE:
             self._move_above_start_time = None
             self._uwb_missing_start_time = None
+            self._uwb_out_of_front_start_time = None
+            self._uwb_capture_start_time = None
             if new_phase not in (Phase.HOVER_ABOVE, Phase.LAND):
                 self._uwb_target_captured = False
         if new_phase != Phase.FORWARD:
