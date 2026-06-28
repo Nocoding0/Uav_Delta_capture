@@ -36,7 +36,8 @@ source /workspace/uav_delta_capture/install/setup.bash
 |---|---|---|---|---|
 | `mock_full` | `test_mission.launch.py` | `test_mission_mock.yaml` | 否 | 全软件状态机和 ROS 链路测试 |
 | `bench_velocity` | `test_mission_bench.launch.py` | `test_mission_bench.yaml` | FCU 必需，UWB/测距/光流/本地位置仅监测 | 不上桨叶，ARM 后发送 Z 轴速度曲线再 DISARM |
-| `takeoff_forward_land` | `test_mission_takeoff_forward_land.launch.py` | `test_mission_takeoff_forward_land.yaml` | FCU、测距、光流、本地位置 | 低高度 GUIDED 起飞、按起飞时机头方向移动约 0.60m、悬停、降落 |
+| `takeoff_forward_land` | `test_mission_takeoff_forward_land.launch.py` | `test_mission_takeoff_forward_land.yaml` | FCU、测距、光流、本地位置 | 低高度 GUIDED 起飞、按起飞时机头方向移动约 1.0m、悬停、降落 |
+| `takeoff_waypoint_return_land` | `test_mission_takeoff_waypoint_return_land.launch.py` | `test_mission_takeoff_waypoint_return_land.yaml` | FCU、测距、光流、本地位置 | 低高度 GUIDED 起飞、按起飞时机头方向定义目标点、返回起点、降落 |
 | `uwb_approach_land` | `test_mission_uwb_approach_land.launch.py` | `test_mission_uwb_approach_land.yaml` | 完整硬件 | 低高度 GUIDED 起飞、UWB 接近 tag 上方、悬停、原地降落 |
 | `real_full` | `test_mission_real_full.launch.py` | `test_mission_real.yaml` | 完整硬件 | 完整起飞、UWB 接近、下降、抓取占位、返航、投放占位、降落 |
 
@@ -199,7 +200,7 @@ Sensor links: FCU=OK mode=GUIDED armed=false RC=OK UWB=OK rangefinder=OK optical
 硬件要求：
 
 - FCU 通过 USB 连接到板子，默认 `/dev/ttyACM0`，波特率 `921600`。
-- UWB 连接到板子串口，当前默认 `/dev/ttySTM1`，波特率 `115200`。
+- UWB 经 CP2102 USB-TTL 连接到板子 USB，当前默认 `/dev/ttyUSB0`，波特率 `115200`。
 - 遥控器已连接飞控，ARM 前油门杆保持最低。
 - 不安装桨叶。
 
@@ -256,7 +257,7 @@ docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 5 r
 UWB 的 `/uwb_aoa/data` 不是 MAVROS 发布的，而是 `uwb_aoa_driver_node` 发布的。`test_mission_bench.launch.py` 会自动启动这个节点，所以最推荐直接跑 bench，然后看最终 `Sensor links` 里的 `UWB=OK/WAIT`。如果要在 bench 前单独预检 UWB，先临时启动驱动：
 
 ```bash
-docker exec -d ros2humble bash -c "source /opt/ros/humble/setup.bash && source /workspace/uav_delta_capture/install/setup.bash && ros2 run uwb_driver uwb_aoa_driver_node --ros-args -p serial_port:=/dev/ttySTM1 -p serial_baud:=115200 > /tmp/uwb_aoa_driver.log 2>&1"
+docker exec -d ros2humble bash -c "source /opt/ros/humble/setup.bash && source /workspace/uav_delta_capture/install/setup.bash && ros2 run uwb_driver uwb_aoa_driver_node --ros-args -p serial_port:=/dev/ttyUSB0 -p serial_baud:=115200 > /tmp/uwb_aoa_driver.log 2>&1"
 
 docker exec ros2humble bash -c "source /opt/ros/humble/setup.bash && timeout 5 ros2 topic echo /uwb_aoa/data --once"
 
@@ -449,7 +450,9 @@ Sensor links: FCU=OK ... RC=OK ... rangefinder=OK ... optical_flow=OK local_pose
 
 LOITER 对比测试使用 `test_mission_takeoff_loiter_land.launch.py`。它沿用简单起降的 MAVROS takeoff 逻辑，到达目标相对高度后先在 `GUIDED` 稳定约 1.5 秒，再切 `LOITER` 悬停，随后切回 `GUIDED` 执行 `LAND`。这个测试用于比较飞控 `LOITER` 定点保持效果，不验证 UWB 接近。
 
-GUIDED 定位前进测试使用 `test_mission_takeoff_forward_land.launch.py`。它沿用简单起降的 MAVROS takeoff 逻辑，到达低高度后保持 `GUIDED`，先把 MAVROS `setpoint_velocity` 的 `mav_frame` 切到 `BODY_NED`，再发送机体系 X 正方向小速度，并用 `/mavros/local_position/pose` 的水平位移达到约 `0.60m` 作为停止条件；随后悬停约 2 秒并 `LAND`。这个测试不依赖 UWB，适合 UWB 串口暂不可用时先验证飞控本地位置和短距离速度控制。
+GUIDED 定位前进测试使用 `test_mission_takeoff_forward_land.launch.py`。它沿用简单起降的 MAVROS takeoff 逻辑，到达低高度后保持 `GUIDED`，先把 MAVROS `setpoint_velocity` 的 `mav_frame` 切到 `BODY_NED`，再发送机体系 X 正方向速度，并用 `/mavros/local_position/pose` 的水平位移达到约 `1.0m` 作为停止条件；随后悬停约 2 秒并 `LAND`。这个测试不依赖 UWB，适合 UWB 串口暂不可用时先验证飞控本地位置和短距离速度控制。
+
+GUIDED 航点往返测试使用 `test_mission_takeoff_waypoint_return_land.launch.py`。它沿用同一套 MAVROS takeoff 逻辑，到达低高度后先把 MAVROS `setpoint_velocity` 的 `mav_frame` 切到 `BODY_NED`，让 `waypoint_dx/waypoint_dy` 按机体系前/右解释；去程用 local_position 水平位移判定到点。目标点悬停后先下降到 `descend_altitude`，低位悬停 `low_hover_time`，再复飞到 `takeoff_altitude` 并稳住；随后节点把 `mav_frame` 切到 `LOCAL_NED`，按 local 坐标闭环平移回起点附近，最后 `LAND`。该测试不主动调转机头，用于验证光流/测距融合得到的 local_position 是否能支撑“去目标点、降落接近、复飞、回起点”。
 
 UWB 接近降落精简测试使用 `test_mission_uwb_approach_land.launch.py`。它沿用简单起降的 MAVROS takeoff 逻辑，到达低高度后保持 `GUIDED`，使用 UWB 方位和距离低速移动到 tag 上方，悬停确认后直接 `LAND`。这个测试不做抓取、复飞、返航、投放，是 `real_full` 前的上桨过渡入口。
 
@@ -705,7 +708,7 @@ docker restart ros2humble
 
 1. MAVROS 没有 heartbeat：检查 FCU USB、`/dev/ttyACM0`、波特率和飞控供电。
 2. 本地位置没有数据：检查光流/测距是否被飞控正常融合，室内无 GPS 时这条链路很关键。
-3. bench 日志里 UWB 是 `WAIT`：桌面速度链路测试仍可继续；检查 `/uwb_aoa/data` 是否有数据，UWB 串口应为 `/dev/ttySTM1`，参数名是 `serial_baud`。
+3. bench 日志里 UWB 是 `WAIT`：桌面速度链路测试仍可继续；检查 `/uwb_aoa/data` 是否有数据，UWB USB 串口应为 `/dev/ttyUSB0`，参数名是 `serial_baud`。
 4. bench 日志里 local_pose 是 `WAIT`：桌面速度链路测试仍可继续；这说明飞控还没输出本地位置，后续 real_full 前必须单独解决。
 5. bench 结果是 `PASS_WITH_WARNINGS`：核心 ARM/速度/DISARM 成功，但至少一个传感器或模式服务未就绪；可以继续桌面验证，但不能直接进入 real_full。
 6. bench 结果是 `FAIL`：核心链路失败，先看 `Core links` 和 `/tmp/mavros.log`。

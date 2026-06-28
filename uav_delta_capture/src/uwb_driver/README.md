@@ -19,7 +19,7 @@ UWB 数据采集主节点。
 - `uwb_aoa/data`（`UavDeltaMsgs/UwbAoa`）- 滤波后的 UWB 数据
 
 **参数：**
-- `serial_port`（string）- 串口路径，代码默认 `/dev/ttySTM1`
+- `serial_port`（string）- 串口路径，代码默认 `/dev/ttyUSB0`
 - `serial_baud`（int）- 波特率，默认 `115200`
 - `uwb_aoa_topic`（string）- 输出话题，默认 `uwb_aoa/data`
 - `signal_loss_timeout_sec`（double）- 信号超时阈值，默认 `0.2`
@@ -35,8 +35,8 @@ UWB 数据采集主节点。
 python sync_to_board.py
 python ssh2board.py "docker exec ros2humble bash -lc 'pkill -f [u]wb_aoa_driver_node || true; source /opt/ros/humble/setup.bash && cd /workspace/uav_delta_capture && colcon build --packages-select uwb_driver --parallel-workers 2'"
 
-# 单独启动 UWB driver。当前板子上 UWB 接 CN5 USART6，设备节点是 /dev/ttySTM1。
-python ssh2board.py "docker exec -d ros2humble bash -lc 'source /opt/ros/humble/setup.bash && source /workspace/uav_delta_capture/install/setup.bash && ros2 run uwb_driver uwb_aoa_driver_node --ros-args -p serial_port:=/dev/ttySTM1 -p serial_baud:=115200 > /tmp/uwb_aoa_driver.log 2>&1'"
+# 单独启动 UWB driver。当前板子上 UWB 经 CP2102 USB-TTL 接入，设备节点是 /dev/ttyUSB0。
+python ssh2board.py "docker exec -d ros2humble bash -lc 'source /opt/ros/humble/setup.bash && source /workspace/uav_delta_capture/install/setup.bash && ros2 run uwb_driver uwb_aoa_driver_node --ros-args -p serial_port:=/dev/ttyUSB0 -p serial_baud:=115200 > /tmp/uwb_aoa_driver.log 2>&1'"
 
 # 或使用 launch/config 启动
 python ssh2board.py "docker exec -d ros2humble bash -lc 'source /opt/ros/humble/setup.bash && source /workspace/uav_delta_capture/install/setup.bash && ros2 launch uwb_driver uwb_aoa_driver.launch.py > /tmp/uwb_aoa_driver.log 2>&1'"
@@ -47,7 +47,7 @@ python ssh2board.py "docker exec -d ros2humble bash -lc 'source /opt/ros/humble/
 ```bash
 source /opt/ros/humble/setup.bash
 source /workspace/uav_delta_capture/install/setup.bash
-ros2 run uwb_driver uwb_aoa_driver_node --ros-args -p serial_port:=/dev/ttySTM1 -p serial_baud:=115200
+ros2 run uwb_driver uwb_aoa_driver_node --ros-args -p serial_port:=/dev/ttyUSB0 -p serial_baud:=115200
 ```
 
 ## 监测
@@ -90,7 +90,7 @@ python ssh2board.py "docker exec ros2humble bash -lc 'ps -eo pid,ppid,cmd | grep
 
 关键参数：
 
-- `serial_port`: 串口路径，当前实机通常是 `/dev/ttySTM1`
+- `serial_port`: 串口路径，当前实机是 CP2102 USB-TTL 的 `/dev/ttyUSB0`
 - `serial_baud`: 波特率，当前是 `115200`
 - `uwb_aoa_topic`: 输出话题，默认 `uwb_aoa/data`
 - `signal_loss_timeout_sec`: 多久没收到新帧后标记为无效

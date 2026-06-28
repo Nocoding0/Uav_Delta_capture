@@ -36,7 +36,7 @@ def generate_launch_description():
             package='uwb_driver',
             executable='uwb_aoa_driver_node',
             name='uwb_aoa_driver_node',
-            parameters=[{'serial_port': '/dev/ttySTM1', 'serial_baud': 115200}],
+            parameters=[{'serial_port': '/dev/ttyUSB0', 'serial_baud': 115200}],
         ),
         Node(
             package='uwb_navigation',

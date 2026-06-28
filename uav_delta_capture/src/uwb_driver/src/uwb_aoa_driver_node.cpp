@@ -125,7 +125,7 @@ class UwbAoaDriverNode : public rclcpp::Node
 public:
   UwbAoaDriverNode()
   : Node("uwb_aoa_driver_node"),
-    serial_port_(declare_parameter<std::string>("serial_port", "/dev/ttySTM1")),
+    serial_port_(declare_parameter<std::string>("serial_port", "/dev/ttyUSB0")),
     serial_baud_(declare_parameter<int>("serial_baud", 115200)),
     uwb_frame_id_(declare_parameter<std::string>("uwb_frame_id", "uwb")),
     uwb_aoa_topic_(declare_parameter<std::string>("uwb_aoa_topic", "uwb_aoa/data")),

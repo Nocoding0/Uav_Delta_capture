@@ -6,6 +6,7 @@ Mission modes:
   - bench_velocity: real hardware preflight + ARM + short Z velocity profile + DISARM.
   - takeoff_loiter_land: climb gently in GUIDED, hover in LOITER, switch back to GUIDED, land.
   - takeoff_forward_land: low GUIDED takeoff, body-forward local-position move, hover, land.
+  - takeoff_waypoint_return_land: low GUIDED takeoff, local-position waypoint, return, land.
   - uwb_approach_land: low GUIDED takeoff, UWB approach to tag, hover, land.
   - real_full: take off, UWB approach, descend, fake/real grasp, climb, return, drop, land.
 """
@@ -18,6 +19,8 @@ import rclpy
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from mavros_msgs.msg import OpticalFlow, State as MavrosState
 from mavros_msgs.srv import SetMode
+from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+from rcl_interfaces.srv import SetParameters
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -60,6 +63,14 @@ class Phase(Enum):
     LAND_WAIT = 21
     FORWARD = 22
     HOVER_FORWARD = 23
+    WAYPOINT_OUTBOUND = 24
+    HOVER_WAYPOINT = 25
+    WAYPOINT_RETURN = 26
+    HOVER_RETURN_HOME = 27
+    WAYPOINT_DESCEND = 28
+    HOVER_WAYPOINT_LOW = 29
+    WAYPOINT_RECLIMB = 30
+    HOVER_WAYPOINT_RECLIMB = 31
 
 
 PHASE_NAMES = {phase: phase.name for phase in Phase}
@@ -159,6 +170,17 @@ class TestMissionNode(Node):
 
         self.azimuth_deadband = self.declare_parameter("azimuth_deadband", 3.0).value
         self.horizontal_deadband = self.declare_parameter("horizontal_deadband", 0.15).value
+        self.uwb_azimuth_offset_deg = self.declare_parameter("uwb_azimuth_offset_deg", 0.0).value
+        self.uwb_forward_sign = self.declare_parameter("uwb_forward_sign", 1.0).value
+        self.uwb_lateral_sign = self.declare_parameter("uwb_lateral_sign", 1.0).value
+        self.uwb_capture_radius_m = self.declare_parameter("uwb_capture_radius_m", 0.55).value
+        self.uwb_slow_radius_m = self.declare_parameter("uwb_slow_radius_m", 1.0).value
+        self.uwb_slow_max_vel_xy = self.declare_parameter("uwb_slow_max_vel_xy", 0.08).value
+        self.uwb_target_hover_time_sec = self.declare_parameter(
+            "uwb_target_hover_time_sec", 0.8
+        ).value
+        self.mission_soft_radius_m = self.declare_parameter("mission_soft_radius_m", 2.0).value
+        self.mission_hard_radius_m = self.declare_parameter("mission_hard_radius_m", 2.5).value
         self.altitude_tolerance = self.declare_parameter("altitude_tolerance", 0.15).value
         self.return_xy_tolerance = self.declare_parameter("return_xy_tolerance", 0.3).value
 
@@ -177,6 +199,20 @@ class TestMissionNode(Node):
         self.forward_timeout_sec = self.declare_parameter(
             "forward_timeout_sec", 8.0
         ).value
+        self.waypoint_dx = self.declare_parameter("waypoint_dx", 1.0).value
+        self.waypoint_dy = self.declare_parameter("waypoint_dy", 0.0).value
+        self.kp_waypoint = self.declare_parameter("kp_waypoint", 0.45).value
+        self.waypoint_max_velocity = self.declare_parameter(
+            "waypoint_max_velocity", 0.3
+        ).value
+        self.waypoint_xy_tolerance = self.declare_parameter(
+            "waypoint_xy_tolerance", 0.2
+        ).value
+        self.waypoint_timeout_sec = self.declare_parameter(
+            "waypoint_timeout_sec", 12.0
+        ).value
+        self.return_hover_time = self.declare_parameter("return_hover_time", 2.0).value
+        self.low_hover_time = self.declare_parameter("low_hover_time", 4.0).value
         self.target_hover_time = self.declare_parameter("target_hover_time", 2.0).value
 
         self.require_uwb_ready = self.declare_parameter("require_uwb_ready", True).value
@@ -239,9 +275,27 @@ class TestMissionNode(Node):
         self.mode_confirm_timeout_sec = max(0.5, float(self.mode_confirm_timeout_sec))
         self.move_above_timeout_sec = max(1.0, float(self.move_above_timeout_sec))
         self.uwb_missing_timeout_sec = max(0.2, float(self.uwb_missing_timeout_sec))
+        self.uwb_capture_radius_m = max(0.1, float(self.uwb_capture_radius_m))
+        self.uwb_slow_radius_m = max(self.uwb_capture_radius_m, float(self.uwb_slow_radius_m))
+        self.uwb_slow_max_vel_xy = clamp(
+            abs(float(self.uwb_slow_max_vel_xy)), 0.02, self.max_vel_xy
+        )
+        self.uwb_target_hover_time_sec = max(0.1, float(self.uwb_target_hover_time_sec))
+        self.mission_soft_radius_m = max(0.1, float(self.mission_soft_radius_m))
+        self.mission_hard_radius_m = max(self.mission_soft_radius_m, float(self.mission_hard_radius_m))
         self.forward_target_distance = max(0.05, float(self.forward_target_distance))
         self.forward_velocity = clamp(abs(float(self.forward_velocity)), 0.03, self.max_vel_xy)
         self.forward_timeout_sec = max(1.0, float(self.forward_timeout_sec))
+        self.waypoint_dx = float(self.waypoint_dx)
+        self.waypoint_dy = float(self.waypoint_dy)
+        self.kp_waypoint = max(0.01, float(self.kp_waypoint))
+        self.waypoint_max_velocity = clamp(
+            abs(float(self.waypoint_max_velocity)), 0.03, self.max_vel_xy
+        )
+        self.waypoint_xy_tolerance = max(0.05, float(self.waypoint_xy_tolerance))
+        self.waypoint_timeout_sec = max(1.0, float(self.waypoint_timeout_sec))
+        self.return_hover_time = max(0.2, float(self.return_hover_time))
+        self.low_hover_time = max(0.2, float(self.low_hover_time))
         self.target_hover_time = max(0.2, float(self.target_hover_time))
 
         self.phase = Phase.INIT
@@ -249,6 +303,7 @@ class TestMissionNode(Node):
         self.origin_x = 0.0
         self.origin_y = 0.0
         self.origin_z = 0.0
+        self.origin_yaw = None
         self.origin_range = None
         self.origin_recorded = False
 
@@ -271,6 +326,11 @@ class TestMissionNode(Node):
         self._pending_mode_started = None
         self._pending_mode_request_sent = False
         self._pending_mode_warn_only = False
+        self._pending_mav_frame = None
+        self._pending_mav_frame_next_phase = None
+        self._pending_mav_frame_future = None
+        self._pending_mav_frame_started = None
+        self._pending_mav_frame_request_sent = False
 
         self._data_lock = threading.Lock()
         self._last_uwb = None
@@ -314,8 +374,12 @@ class TestMissionNode(Node):
         self._loiter_alt_loss_start_time = None
         self._move_above_start_time = None
         self._uwb_missing_start_time = None
+        self._uwb_target_captured = False
         self._forward_start_time = None
         self._forward_start_xy = None
+        self._waypoint_start_time = None
+        self._waypoint_target_xy = None
+        self._waypoint_return_start_time = None
         self._land_wait_start_time = None
         self._land_ground_start_time = None
         self._land_disarm_sent = False
@@ -353,6 +417,11 @@ class TestMissionNode(Node):
         )
         self.mavros_set_mode_client = self.create_client(
             SetMode, "/mavros/set_mode", callback_group=cb_group
+        )
+        self.mavros_setpoint_velocity_param_client = self.create_client(
+            SetParameters,
+            "/mavros/setpoint_velocity/set_parameters",
+            callback_group=cb_group,
         )
 
         ctrl_period = 1.0 / max(1.0, self.control_rate_hz)
@@ -426,6 +495,11 @@ class TestMissionNode(Node):
             self._publish_state()
             return
 
+        if self._pending_mav_frame is not None:
+            self._tick_pending_mav_frame_switch()
+            self._publish_state()
+            return
+
         tick_map = {
             Phase.INIT: self._tick_init,
             Phase.ARM: self._tick_arm,
@@ -451,6 +525,14 @@ class TestMissionNode(Node):
             Phase.HOVER_LOITER: self._tick_hover_loiter,
             Phase.FORWARD: self._tick_forward,
             Phase.HOVER_FORWARD: self._tick_hover_forward,
+            Phase.WAYPOINT_OUTBOUND: self._tick_waypoint_outbound,
+            Phase.HOVER_WAYPOINT: self._tick_hover_waypoint,
+            Phase.WAYPOINT_RETURN: self._tick_waypoint_return,
+            Phase.HOVER_RETURN_HOME: self._tick_hover_return_home,
+            Phase.WAYPOINT_DESCEND: self._tick_waypoint_descend,
+            Phase.HOVER_WAYPOINT_LOW: self._tick_hover_waypoint_low,
+            Phase.WAYPOINT_RECLIMB: self._tick_waypoint_reclimb,
+            Phase.HOVER_WAYPOINT_RECLIMB: self._tick_hover_waypoint_reclimb,
         }
         tick_map[self.phase]()
         self._publish_state()
@@ -485,9 +567,28 @@ class TestMissionNode(Node):
             mode = (fcu.mode or "").upper()
             if mode and mode not in self._allowed_auto_modes():
                 self.previous_flight_phase = self.phase
+                self._publish_velocity(0.0, 0.0, 0.0, immediate=True)
                 self._publish_event(f"manual_takeover:{mode}")
                 self._transition(Phase.PAUSED_MANUAL)
                 return True
+
+        radius = self._mission_xy_distance_from_origin()
+        if (
+            self._is_uwb_approach_land_mode()
+            and radius is not None
+            and radius >= self.mission_hard_radius_m
+            and self.phase not in (Phase.LAND_WAIT, Phase.PAUSED_MANUAL)
+        ):
+            reason = (
+                f"Mission hard radius exceeded: r={radius:.2f}/"
+                f"{self.mission_hard_radius_m:.2f}m"
+            )
+            self._publish_velocity(0.0, 0.0, 0.0, immediate=True)
+            self._publish_event("failsafe_mission_radius")
+            self.get_logger().error(reason)
+            self._takeoff_land_abort_reason = reason
+            self._transition(Phase.FAILSAFE)
+            return True
 
         return False
 
@@ -579,6 +680,25 @@ class TestMissionNode(Node):
                 return None
             p = self._last_local_pose.pose.position
             return (p.x, p.y)
+
+    def _mission_xy_distance_from_origin(self):
+        if not self.origin_recorded:
+            return None
+        pos = self._get_local_xy()
+        if pos is None:
+            return None
+        dx = pos[0] - self.origin_x
+        dy = pos[1] - self.origin_y
+        return math.sqrt(dx * dx + dy * dy)
+
+    def _get_local_yaw(self):
+        with self._data_lock:
+            if self._last_local_pose is None:
+                return None
+            q = self._last_local_pose.pose.orientation
+            siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+            return math.atan2(siny_cosp, cosy_cosp)
 
     def _get_local_z(self):
         with self._data_lock:
@@ -767,6 +887,7 @@ class TestMissionNode(Node):
             "takeoff_hover_land",
             "takeoff_loiter_land",
             "takeoff_forward_land",
+            "takeoff_waypoint_return_land",
             "uwb_approach_land",
         )
 
@@ -776,6 +897,9 @@ class TestMissionNode(Node):
     def _is_takeoff_forward_land_mode(self) -> bool:
         return self.mission_mode == "takeoff_forward_land"
 
+    def _is_takeoff_waypoint_return_land_mode(self) -> bool:
+        return self.mission_mode == "takeoff_waypoint_return_land"
+
     def _is_uwb_approach_land_mode(self) -> bool:
         return self.mission_mode == "uwb_approach_land"
 
@@ -784,6 +908,8 @@ class TestMissionNode(Node):
             return "TAKEOFF_LOITER_LAND"
         if self._is_takeoff_forward_land_mode():
             return "TAKEOFF_FORWARD_LAND"
+        if self._is_takeoff_waypoint_return_land_mode():
+            return "TAKEOFF_WAYPOINT_RETURN_LAND"
         if self._is_uwb_approach_land_mode():
             return "UWB_APPROACH_LAND"
         return "TAKEOFF_LAND"
@@ -793,6 +919,8 @@ class TestMissionNode(Node):
             return "Takeoff-loiter-land"
         if self._is_takeoff_forward_land_mode():
             return "Takeoff-forward-land"
+        if self._is_takeoff_waypoint_return_land_mode():
+            return "Takeoff-waypoint-return-land"
         if self._is_uwb_approach_land_mode():
             return "UWB approach-land"
         return "Takeoff-land"
@@ -817,6 +945,8 @@ class TestMissionNode(Node):
             )
         if self._is_takeoff_forward_land_mode():
             core_ok = core_ok and self._takeoff_land_forward_ok
+        if self._is_takeoff_waypoint_return_land_mode():
+            core_ok = core_ok and self._takeoff_land_forward_ok and self._takeoff_land_guided_return_ok
         if self._is_uwb_approach_land_mode():
             core_ok = core_ok and self._uwb_approach_ok
         sensor_ok = (
@@ -865,6 +995,16 @@ class TestMissionNode(Node):
                 f"TAKEOFF={'OK' if self._takeoff_land_takeoff_ok else 'FAIL'} "
                 f"HOVER={'OK' if self._takeoff_land_hover_ok else 'FAIL'} "
                 f"FORWARD={'OK' if self._takeoff_land_forward_ok else 'FAIL'} "
+                f"LAND={'OK' if self._takeoff_land_land_ok else 'FAIL'}"
+            )
+        elif self._is_takeoff_waypoint_return_land_mode():
+            core_text = (
+                "Core links: "
+                f"ARM={'OK' if self._bench_arm_ok else 'FAIL'} "
+                f"TAKEOFF={'OK' if self._takeoff_land_takeoff_ok else 'FAIL'} "
+                f"HOVER={'OK' if self._takeoff_land_hover_ok else 'FAIL'} "
+                f"WAYPOINT={'OK' if self._takeoff_land_forward_ok else 'FAIL'} "
+                f"RETURN={'OK' if self._takeoff_land_guided_return_ok else 'FAIL'} "
                 f"LAND={'OK' if self._takeoff_land_land_ok else 'FAIL'}"
             )
         else:
@@ -1190,6 +1330,15 @@ class TestMissionNode(Node):
                     if self.phase == Phase.FORWARD:
                         self._takeoff_land_hover_ok = True
                     return
+                if self._is_takeoff_waypoint_return_land_mode():
+                    self._check_stable_and_transition(
+                        Phase.WAYPOINT_OUTBOUND,
+                        f"Takeoff waypoint hover stable at rel_alt={rel_alt:.2f}m ({source}), starting waypoint move",
+                        "takeoff_waypoint_hover_stable",
+                    )
+                    if self.phase == Phase.WAYPOINT_OUTBOUND:
+                        self._takeoff_land_hover_ok = True
+                    return
                 self._check_stable_and_transition(
                     Phase.LAND,
                     f"Takeoff-land hover stable at rel_alt={rel_alt:.2f}m ({source})",
@@ -1327,6 +1476,315 @@ class TestMissionNode(Node):
             throttle_duration_sec=1.0,
         )
 
+    def _tick_waypoint_outbound(self):
+        if self.use_mock:
+            self.get_logger().info("Mock WAYPOINT_OUTBOUND complete")
+            self._takeoff_land_forward_ok = True
+            self._transition(Phase.HOVER_WAYPOINT)
+            return
+
+        now = self.get_clock().now()
+        pos = self._get_local_xy()
+        if pos is None:
+            self._publish_velocity(0.0, 0.0, 0.0)
+            reason = "No local pose during waypoint outbound"
+            self.get_logger().error(reason)
+            self._takeoff_land_abort_reason = reason
+            self._transition(Phase.FAILSAFE)
+            return
+
+        if self._waypoint_start_time is None:
+            self._waypoint_start_time = now
+            self._forward_start_xy = pos
+            self.get_logger().info(
+                f"Waypoint outbound BODY_NED started: origin=({self.origin_x:.2f}, {self.origin_y:.2f}) "
+                f"current=({pos[0]:.2f}, {pos[1]:.2f}) body_offset=({self.waypoint_dx:.2f}, {self.waypoint_dy:.2f})"
+            )
+
+        dx = pos[0] - self._forward_start_xy[0]
+        dy = pos[1] - self._forward_start_xy[1]
+        dist = math.sqrt(dx * dx + dy * dy)
+        target_dist = math.sqrt(self.waypoint_dx * self.waypoint_dx + self.waypoint_dy * self.waypoint_dy)
+        elapsed = (now - self._waypoint_start_time).nanoseconds / 1e9
+
+        if dist >= max(self.waypoint_xy_tolerance, target_dist):
+            self._publish_velocity(0.0, 0.0, 0.0)
+            self.get_logger().info(
+                f"Waypoint outbound reached by displacement: d={dist:.2f}/{target_dist:.2f}m"
+            )
+            self._takeoff_land_forward_ok = True
+            self._publish_event("waypoint_reached")
+            self._transition(Phase.HOVER_WAYPOINT)
+            return
+
+        if elapsed >= self.waypoint_timeout_sec:
+            self._publish_velocity(0.0, 0.0, 0.0)
+            reason = (
+                f"WAYPOINT outbound timeout: d={dist:.2f}/{target_dist:.2f}m "
+                f"after {elapsed:.1f}s"
+            )
+            self.get_logger().error(reason)
+            self._takeoff_land_abort_reason = reason
+            self._transition(Phase.FAILSAFE)
+            return
+
+        rel_alt, source = self._get_takeoff_land_relative_altitude()
+        vz = 0.0
+        if rel_alt is not None:
+            alt_err = self.takeoff_altitude - rel_alt
+            vz = clamp(self.kp_vertical * alt_err, -self.max_vel_z, self.max_vel_z)
+
+        vx_body = clamp(self.kp_waypoint * self.waypoint_dx, -self.waypoint_max_velocity, self.waypoint_max_velocity)
+        vy_body = clamp(self.kp_waypoint * self.waypoint_dy, -self.waypoint_max_velocity, self.waypoint_max_velocity)
+        speed = math.sqrt(vx_body * vx_body + vy_body * vy_body)
+        if speed > self.waypoint_max_velocity:
+            scale = self.waypoint_max_velocity / speed
+            vx_body *= scale
+            vy_body *= scale
+
+        self._publish_velocity(vx_body, vy_body, vz, frame_id="body")
+        alt_text = "missing" if rel_alt is None else f"{rel_alt:.2f}m ({source})"
+        self.get_logger().info(
+            f"Waypoint outbound BODY_NED moving: d={dist:.2f}/{target_dist:.2f}m "
+            f"elapsed={elapsed:.1f}/{self.waypoint_timeout_sec:.1f}s "
+            f"rel_alt={alt_text} cmd_body=({vx_body:.2f},{vy_body:.2f},{vz:.2f})",
+            throttle_duration_sec=1.0,
+        )
+
+    def _tick_hover_waypoint(self):
+        self._publish_velocity(0.0, 0.0, 0.0)
+        now = self.get_clock().now()
+        if self.hover_start_time is None:
+            self.hover_start_time = now
+            self.get_logger().info(
+                f"Waypoint hover started, holding {self.target_hover_time:.1f}s before descend"
+            )
+            return
+        elapsed = (now - self.hover_start_time).nanoseconds / 1e9
+        if elapsed >= self.target_hover_time:
+            self.get_logger().info("Waypoint hover stable, descending at target")
+            self._publish_event("waypoint_hover_done")
+            self._transition(Phase.WAYPOINT_DESCEND)
+            return
+        self.get_logger().info(
+            f"Waypoint hover holding {elapsed:.1f}/{self.target_hover_time:.1f}s",
+            throttle_duration_sec=1.0,
+        )
+
+    def _tick_waypoint_descend(self):
+        if self.use_mock:
+            self.get_logger().info("Mock WAYPOINT_DESCEND complete")
+            self._transition(Phase.HOVER_WAYPOINT_LOW)
+            return
+
+        rel_alt, source = self._get_takeoff_land_relative_altitude()
+        if rel_alt is None:
+            self._publish_velocity(0.0, 0.0, 0.0, frame_id="body")
+            self.hover_start_time = None
+            self.get_logger().warn(
+                "Waypoint descend waiting for relative altitude source...",
+                throttle_duration_sec=1.0,
+            )
+            return
+
+        alt_err = self.descend_altitude - rel_alt
+        vz = clamp(self.kp_vertical * alt_err, -self.max_vel_z, self.max_vel_z)
+        self._publish_velocity(0.0, 0.0, vz, frame_id="body")
+
+        if abs(alt_err) <= self.altitude_tolerance:
+            self._check_stable_and_transition(
+                Phase.HOVER_WAYPOINT_LOW,
+                f"Waypoint low altitude stable at rel_alt={rel_alt:.2f}m ({source})",
+                "waypoint_low_altitude_reached",
+            )
+            return
+
+        self.hover_start_time = None
+        self.get_logger().info(
+            f"Waypoint descending: rel_alt={rel_alt:.2f}/{self.descend_altitude:.2f}m "
+            f"({source}) cmd_body=(0.00,0.00,{vz:.2f})",
+            throttle_duration_sec=1.0,
+        )
+
+    def _tick_hover_waypoint_low(self):
+        self._publish_velocity(0.0, 0.0, 0.0, frame_id="body")
+        now = self.get_clock().now()
+        if self.hover_start_time is None:
+            self.hover_start_time = now
+            self.get_logger().info(
+                f"Waypoint low hover started, holding {self.low_hover_time:.1f}s before reclimb"
+            )
+            return
+        elapsed = (now - self.hover_start_time).nanoseconds / 1e9
+        if elapsed >= self.low_hover_time:
+            self.get_logger().info("Waypoint low hover stable, reclimbing")
+            self._publish_event("waypoint_low_hover_done")
+            self._transition(Phase.WAYPOINT_RECLIMB)
+            return
+        self.get_logger().info(
+            f"Waypoint low hover holding {elapsed:.1f}/{self.low_hover_time:.1f}s",
+            throttle_duration_sec=1.0,
+        )
+
+    def _tick_waypoint_reclimb(self):
+        if self.use_mock:
+            self.get_logger().info("Mock WAYPOINT_RECLIMB complete")
+            self._transition(Phase.HOVER_WAYPOINT_RECLIMB)
+            return
+
+        rel_alt, source = self._get_takeoff_land_relative_altitude()
+        if rel_alt is None:
+            self._publish_velocity(0.0, 0.0, 0.0, frame_id="body")
+            self.hover_start_time = None
+            self.get_logger().warn(
+                "Waypoint reclimb waiting for relative altitude source...",
+                throttle_duration_sec=1.0,
+            )
+            return
+
+        alt_err = self.takeoff_altitude - rel_alt
+        vz = clamp(self.kp_vertical * alt_err, -self.max_vel_z, self.max_vel_z)
+        self._publish_velocity(0.0, 0.0, vz, frame_id="body")
+
+        if abs(alt_err) <= self.altitude_tolerance:
+            self._check_stable_and_transition(
+                Phase.HOVER_WAYPOINT_RECLIMB,
+                f"Waypoint reclimb stable at rel_alt={rel_alt:.2f}m ({source})",
+                "waypoint_reclimb_done",
+            )
+            return
+
+        self.hover_start_time = None
+        self.get_logger().info(
+            f"Waypoint reclimbing: rel_alt={rel_alt:.2f}/{self.takeoff_altitude:.2f}m "
+            f"({source}) cmd_body=(0.00,0.00,{vz:.2f})",
+            throttle_duration_sec=1.0,
+        )
+
+    def _tick_hover_waypoint_reclimb(self):
+        self._publish_velocity(0.0, 0.0, 0.0, frame_id="body")
+        now = self.get_clock().now()
+        if self.hover_start_time is None:
+            self.hover_start_time = now
+            self.get_logger().info(
+                f"Waypoint reclimb hover started, holding {self.target_hover_time:.1f}s before return"
+            )
+            return
+        elapsed = (now - self.hover_start_time).nanoseconds / 1e9
+        if elapsed >= self.target_hover_time:
+            self.get_logger().info("Waypoint reclimb hover stable, switching MAVROS velocity frame to LOCAL_NED for return")
+            self._publish_event("waypoint_reclimb_hover_done")
+            self._start_mav_frame_switch("LOCAL_NED", Phase.WAYPOINT_RETURN)
+            return
+        self.get_logger().info(
+            f"Waypoint reclimb hover holding {elapsed:.1f}/{self.target_hover_time:.1f}s",
+            throttle_duration_sec=1.0,
+        )
+
+    def _tick_waypoint_return(self):
+        if self.use_mock:
+            self.get_logger().info("Mock WAYPOINT_RETURN complete")
+            self._takeoff_land_guided_return_ok = True
+            self._transition(Phase.HOVER_RETURN_HOME)
+            return
+
+        reached = self._tick_local_waypoint(
+            (self.origin_x, self.origin_y),
+            "Waypoint return",
+            "WAYPOINT return timeout",
+            "_waypoint_return_start_time",
+        )
+        if reached:
+            self._takeoff_land_guided_return_ok = True
+            self._publish_event("waypoint_returned_home")
+            self._transition(Phase.HOVER_RETURN_HOME)
+
+    def _tick_hover_return_home(self):
+        self._publish_velocity(0.0, 0.0, 0.0)
+        now = self.get_clock().now()
+        if self.hover_start_time is None:
+            self.hover_start_time = now
+            self.get_logger().info(
+                f"Home hover started, holding {self.return_hover_time:.1f}s before LAND"
+            )
+            return
+        elapsed = (now - self.hover_start_time).nanoseconds / 1e9
+        if elapsed >= self.return_hover_time:
+            self.get_logger().info("Home hover stable, landing")
+            self._publish_event("waypoint_home_hover_done")
+            self._transition(Phase.LAND)
+            return
+        self.get_logger().info(
+            f"Home hover holding {elapsed:.1f}/{self.return_hover_time:.1f}s",
+            throttle_duration_sec=1.0,
+        )
+
+    def _tick_local_waypoint(self, target_xy, label: str, timeout_label: str, start_attr: str) -> bool:
+        now = self.get_clock().now()
+        pos = self._get_local_xy()
+        if pos is None:
+            self._publish_velocity(0.0, 0.0, 0.0)
+            reason = f"No local pose during {label.lower()}"
+            self.get_logger().error(reason)
+            self._takeoff_land_abort_reason = reason
+            self._transition(Phase.FAILSAFE)
+            return False
+
+        if getattr(self, start_attr) is None:
+            setattr(self, start_attr, now)
+            self.get_logger().info(
+                f"{label} started: current=({pos[0]:.2f}, {pos[1]:.2f}) "
+                f"target=({target_xy[0]:.2f}, {target_xy[1]:.2f})"
+            )
+
+        err_x = target_xy[0] - pos[0]
+        err_y = target_xy[1] - pos[1]
+        dist = math.sqrt(err_x * err_x + err_y * err_y)
+        elapsed = (now - getattr(self, start_attr)).nanoseconds / 1e9
+
+        if dist <= self.waypoint_xy_tolerance:
+            self._publish_velocity(0.0, 0.0, 0.0)
+            self.get_logger().info(
+                f"{label} reached: d={dist:.2f}/{self.waypoint_xy_tolerance:.2f}m"
+            )
+            return True
+
+        if elapsed >= self.waypoint_timeout_sec:
+            self._publish_velocity(0.0, 0.0, 0.0)
+            reason = (
+                f"{timeout_label}: d={dist:.2f}/{self.waypoint_xy_tolerance:.2f}m "
+                f"after {elapsed:.1f}s"
+            )
+            self.get_logger().error(reason)
+            self._takeoff_land_abort_reason = reason
+            self._transition(Phase.FAILSAFE)
+            return False
+
+        vx = self.kp_waypoint * err_x
+        vy = self.kp_waypoint * err_y
+        speed = math.sqrt(vx * vx + vy * vy)
+        if speed > self.waypoint_max_velocity:
+            scale = self.waypoint_max_velocity / speed
+            vx *= scale
+            vy *= scale
+
+        rel_alt, source = self._get_takeoff_land_relative_altitude()
+        vz = 0.0
+        if rel_alt is not None:
+            alt_err = self.takeoff_altitude - rel_alt
+            vz = clamp(self.kp_vertical * alt_err, -self.max_vel_z, self.max_vel_z)
+
+        self._publish_velocity(vx, vy, vz, frame_id="local")
+        alt_text = "missing" if rel_alt is None else f"{rel_alt:.2f}m ({source})"
+        self.get_logger().info(
+            f"{label} moving: d={dist:.2f}/{self.waypoint_xy_tolerance:.2f}m "
+            f"elapsed={elapsed:.1f}/{self.waypoint_timeout_sec:.1f}s "
+            f"err=({err_x:.2f},{err_y:.2f}) rel_alt={alt_text} "
+            f"cmd_local=({vx:.2f},{vy:.2f},{vz:.2f})",
+            throttle_duration_sec=1.0,
+        )
+        return False
+
     def _tick_hover_loiter(self):
         self._publish_velocity(0.0, 0.0, 0.0)
         rel_alt, source = self._get_takeoff_land_relative_altitude()
@@ -1434,16 +1892,31 @@ class TestMissionNode(Node):
             return
 
         self._uwb_missing_start_time = None
-        azimuth, distance, _ = uwb
+        raw_azimuth, distance, elevation = uwb
+        azimuth = raw_azimuth - self.uwb_azimuth_offset_deg
         az_rad = azimuth * math.pi / 180.0
-        horizontal_dist = distance * math.cos(az_rad)
+        el_rad = elevation * math.pi / 180.0
+        horizontal_dist = abs(distance * math.cos(el_rad))
+        forward_dist = horizontal_dist * math.cos(az_rad)
+        lateral_dist = horizontal_dist * math.sin(az_rad)
 
         vx = 0.0
         vy = 0.0
-        if abs(azimuth) > self.azimuth_deadband:
-            vx = clamp(-self.kp_horizontal * az_rad * self.max_vel_xy, -self.max_vel_xy, self.max_vel_xy)
-        if horizontal_dist > self.horizontal_deadband:
-            vy = clamp(-self.kp_horizontal * horizontal_dist, -self.max_vel_xy, self.max_vel_xy)
+        stop_radius = self.uwb_capture_radius_m if self._is_uwb_approach_land_mode() else self.horizontal_deadband
+        speed_limit = self.max_vel_xy
+        if self._is_uwb_approach_land_mode() and horizontal_dist <= self.uwb_slow_radius_m:
+            speed_limit = min(speed_limit, self.uwb_slow_max_vel_xy)
+        if horizontal_dist > stop_radius:
+            vx = clamp(
+                self.uwb_forward_sign * self.kp_horizontal * forward_dist,
+                -speed_limit,
+                speed_limit,
+            )
+            vy = clamp(
+                self.uwb_lateral_sign * self.kp_horizontal * lateral_dist,
+                -speed_limit,
+                speed_limit,
+            )
 
         if self._is_uwb_approach_land_mode():
             rel_alt, alt_source = self._get_takeoff_land_relative_altitude()
@@ -1454,7 +1927,35 @@ class TestMissionNode(Node):
             alt_err = self.takeoff_altitude - rel_alt
         vz = clamp(self.kp_vertical * alt_err, -self.max_vel_z, self.max_vel_z)
 
-        self._publish_velocity(vx, vy, vz)
+        radius = self._mission_xy_distance_from_origin()
+        if self._is_uwb_approach_land_mode() and horizontal_dist <= self.uwb_capture_radius_m:
+            self._uwb_target_captured = True
+            self._uwb_approach_ok = True
+            self._publish_velocity(0.0, 0.0, vz, frame_id="body", immediate=True)
+            self._publish_event("uwb_target_captured")
+            self.get_logger().info(
+                f"UWB target captured: az={azimuth:.1f}deg raw_az={raw_azimuth:.1f}deg "
+                f"el={elevation:.1f}deg hdist={horizontal_dist:.2f}/"
+                f"{self.uwb_capture_radius_m:.2f}m body_dist=({forward_dist:.2f},{lateral_dist:.2f})"
+            )
+            self._transition(Phase.HOVER_ABOVE)
+            return
+
+        if (
+            self._is_uwb_approach_land_mode()
+            and radius is not None
+            and radius >= self.mission_soft_radius_m
+        ):
+            self._publish_velocity(0.0, 0.0, vz, frame_id="body", immediate=True)
+            self.hover_start_time = None
+            self.get_logger().warn(
+                f"Mission soft radius reached: r={radius:.2f}/"
+                f"{self.mission_soft_radius_m:.2f}m, holding position",
+                throttle_duration_sec=0.5,
+            )
+            return
+
+        self._publish_velocity(vx, vy, vz, frame_id="body")
 
         if abs(azimuth) < self.azimuth_deadband and horizontal_dist < self.horizontal_deadband:
             self._check_stable_and_transition(
@@ -1468,19 +1969,38 @@ class TestMissionNode(Node):
             self.hover_start_time = None
             alt_text = "missing" if rel_alt is None else f"{rel_alt:.2f}m"
             self.get_logger().info(
-                f"UWB approach: az={azimuth:.1f}deg hdist={horizontal_dist:.2f}m "
+                f"UWB approach BODY_NED: az={azimuth:.1f}deg raw_az={raw_azimuth:.1f}deg "
+                f"el={elevation:.1f}deg hdist={horizontal_dist:.2f}m "
+                f"body_dist=({forward_dist:.2f},{lateral_dist:.2f}) "
                 f"rel_alt={alt_text} ({alt_source}) "
-                f"cmd=({vx:.2f},{vy:.2f},{vz:.2f})",
+                f"cmd_body=({vx:.2f},{vy:.2f},{vz:.2f}) speed_limit={speed_limit:.2f}",
                 throttle_duration_sec=1.0,
             )
 
     def _tick_hover_above(self):
-        self._publish_velocity(0.0, 0.0, 0.0)
         if self._is_uwb_approach_land_mode():
-            self._check_stable_and_transition(
-                Phase.LAND, "UWB target hover stable, landing", "uwb_target_hover_done"
+            self._publish_velocity(0.0, 0.0, 0.0, immediate=True)
+            now = self.get_clock().now()
+            if self.hover_start_time is None:
+                self.hover_start_time = now
+                self.get_logger().info(
+                    f"UWB target hover started, holding "
+                    f"{self.uwb_target_hover_time_sec:.1f}s before LAND"
+                )
+                return
+            elapsed = (now - self.hover_start_time).nanoseconds / 1e9
+            if elapsed >= self.uwb_target_hover_time_sec:
+                self.get_logger().info("UWB target hover stable, landing")
+                self._publish_event("uwb_target_hover_done")
+                self._transition(Phase.LAND)
+                return
+            self.get_logger().info(
+                f"UWB target hover holding {elapsed:.1f}/"
+                f"{self.uwb_target_hover_time_sec:.1f}s before LAND",
+                throttle_duration_sec=0.5,
             )
             return
+        self._publish_velocity(0.0, 0.0, 0.0)
         self._check_stable_and_transition(
             Phase.DESCEND, "Hover above target stable", "hover_above_done"
         )
@@ -1670,7 +2190,7 @@ class TestMissionNode(Node):
     def _tick_land(self):
         if self._pending_command:
             return
-        self._publish_velocity(0.0, 0.0, 0.0)
+        self._publish_velocity(0.0, 0.0, 0.0, immediate=True)
         self._pending_command = True
         self._call_flight_cmd(FlightCommand.Request.CMD_MODE_LAND, 0.0, self._on_land_result)
 
@@ -1686,7 +2206,7 @@ class TestMissionNode(Node):
                 self._report_takeoff_land_result("LAND failed")
 
     def _tick_land_wait(self):
-        self._publish_velocity(0.0, 0.0, 0.0)
+        self._publish_velocity(0.0, 0.0, 0.0, immediate=True)
         now = self.get_clock().now()
         if self._land_wait_start_time is None:
             self._land_wait_start_time = now
@@ -1790,10 +2310,10 @@ class TestMissionNode(Node):
             self._report_takeoff_land_result(self._takeoff_land_abort_reason)
 
     def _tick_done(self):
-        self._publish_velocity(0.0, 0.0, 0.0)
+        self._publish_velocity(0.0, 0.0, 0.0, immediate=True)
 
     def _tick_paused_manual(self):
-        self._publish_velocity(0.0, 0.0, 0.0)
+        self._publish_velocity(0.0, 0.0, 0.0, immediate=True)
         self.get_logger().warn(
             "Mission paused by RC/mode takeover. Restart mission node to resume autonomy.",
             throttle_duration_sec=5.0,
@@ -1819,7 +2339,7 @@ class TestMissionNode(Node):
             self._transition(Phase.FAILSAFE)
 
     def _tick_failsafe(self):
-        self._publish_velocity(0.0, 0.0, 0.0)
+        self._publish_velocity(0.0, 0.0, 0.0, immediate=True)
         if self._pending_command:
             return
 
@@ -1865,12 +2385,14 @@ class TestMissionNode(Node):
         local_z = self._get_local_z()
         if local_z is not None:
             self.origin_z = local_z
+        self.origin_yaw = self._get_local_yaw()
         self.origin_range = self._get_rangefinder_m()
         self.origin_recorded = True
         range_text = "none" if self.origin_range is None else f"{self.origin_range:.2f}"
+        yaw_text = "none" if self.origin_yaw is None else f"{math.degrees(self.origin_yaw):.1f}deg"
         self.get_logger().info(
             f"Origin recorded: ({self.origin_x:.2f}, {self.origin_y:.2f}) "
-            f"z={self.origin_z:.2f} range={range_text}"
+            f"z={self.origin_z:.2f} yaw={yaw_text} range={range_text}"
         )
 
     def _check_stable_and_transition(self, next_phase: Phase, log_msg: str, event: str):
@@ -1906,9 +2428,17 @@ class TestMissionNode(Node):
         if new_phase != Phase.MOVE_ABOVE:
             self._move_above_start_time = None
             self._uwb_missing_start_time = None
+            if new_phase not in (Phase.HOVER_ABOVE, Phase.LAND):
+                self._uwb_target_captured = False
         if new_phase != Phase.FORWARD:
             self._forward_start_time = None
             self._forward_start_xy = None
+        if new_phase != Phase.WAYPOINT_OUTBOUND:
+            self._waypoint_start_time = None
+            if new_phase != Phase.HOVER_WAYPOINT:
+                self._waypoint_target_xy = None
+        if new_phase != Phase.WAYPOINT_RETURN:
+            self._waypoint_return_start_time = None
         if new_phase != Phase.LAND_WAIT:
             self._land_wait_start_time = None
             self._land_ground_start_time = None
@@ -1916,14 +2446,22 @@ class TestMissionNode(Node):
             self._land_disarm_retry_count = 0
             self._land_disarm_retry_time = None
 
-    def _publish_velocity(self, vx: float, vy: float, vz: float, frame_id: str = "body"):
+    def _publish_velocity(
+        self,
+        vx: float,
+        vy: float,
+        vz: float,
+        frame_id: str = "body",
+        immediate: bool = False,
+    ):
         now = self.get_clock().now()
-        dt = max((now - self._last_velocity_time).nanoseconds / 1e9, 1.0 / max(self.control_rate_hz, 1.0))
-        max_delta = self.velocity_slew_rate * dt
-        last_vx, last_vy, last_vz = self._last_velocity
-        vx = clamp(vx, last_vx - max_delta, last_vx + max_delta)
-        vy = clamp(vy, last_vy - max_delta, last_vy + max_delta)
-        vz = clamp(vz, last_vz - max_delta, last_vz + max_delta)
+        if not immediate:
+            dt = max((now - self._last_velocity_time).nanoseconds / 1e9, 1.0 / max(self.control_rate_hz, 1.0))
+            max_delta = self.velocity_slew_rate * dt
+            last_vx, last_vy, last_vz = self._last_velocity
+            vx = clamp(vx, last_vx - max_delta, last_vx + max_delta)
+            vy = clamp(vy, last_vy - max_delta, last_vy + max_delta)
+            vz = clamp(vz, last_vz - max_delta, last_vz + max_delta)
 
         msg = TwistStamped()
         msg.header.stamp = now.to_msg()
@@ -2142,6 +2680,92 @@ class TestMissionNode(Node):
                 self._transition(Phase.FAILSAFE)
             return
 
+        self._publish_velocity(0.0, 0.0, 0.0)
+        if self._is_takeoff_land_mode():
+            self._report_takeoff_land_result(reason)
+        self._transition(Phase.FAILSAFE)
+
+    def _start_mav_frame_switch(self, frame: str, next_phase: Phase):
+        if self.use_mock:
+            self._transition(next_phase)
+            return
+
+        self._pending_mav_frame = frame
+        self._pending_mav_frame_next_phase = next_phase
+        self._pending_mav_frame_future = None
+        self._pending_mav_frame_started = self.get_clock().now()
+        self._pending_mav_frame_request_sent = False
+        self.get_logger().info(
+            f"Requesting MAVROS setpoint_velocity mav_frame={frame} before {PHASE_NAMES[next_phase]}"
+        )
+
+    def _tick_pending_mav_frame_switch(self):
+        frame = self._pending_mav_frame
+        next_phase = self._pending_mav_frame_next_phase
+        now = self.get_clock().now()
+        elapsed = (now - self._pending_mav_frame_started).nanoseconds / 1e9
+
+        if not self._pending_mav_frame_request_sent:
+            if not self.mavros_setpoint_velocity_param_client.service_is_ready():
+                if elapsed >= self.set_mode_service_timeout_sec:
+                    self._finish_mav_frame_switch_failure(
+                        f"MAVROS setpoint_velocity parameter service not ready after {elapsed:.1f}s"
+                    )
+                else:
+                    self.get_logger().warn(
+                        "Waiting for MAVROS setpoint_velocity parameter service...",
+                        throttle_duration_sec=1.0,
+                    )
+                return
+
+            param = Parameter()
+            param.name = "mav_frame"
+            param.value = ParameterValue()
+            param.value.type = ParameterType.PARAMETER_STRING
+            param.value.string_value = frame
+            req = SetParameters.Request()
+            req.parameters = [param]
+            self._pending_mav_frame_future = self.mavros_setpoint_velocity_param_client.call_async(req)
+            self._pending_mav_frame_request_sent = True
+            self.get_logger().info(f"MAVROS setpoint_velocity mav_frame={frame} request sent")
+            return
+
+        if self._pending_mav_frame_future is not None and self._pending_mav_frame_future.done():
+            try:
+                result = self._pending_mav_frame_future.result()
+                if not result.results or not result.results[0].successful:
+                    reason = "unknown"
+                    if result.results:
+                        reason = result.results[0].reason or "rejected"
+                    self._finish_mav_frame_switch_failure(
+                        f"MAVROS setpoint_velocity mav_frame={frame} rejected: {reason}"
+                    )
+                    return
+                self.get_logger().info(f"MAVROS setpoint_velocity mav_frame confirmed: {frame}")
+                self._clear_pending_mav_frame_switch()
+                self._transition(next_phase)
+            except Exception as exc:
+                self._finish_mav_frame_switch_failure(
+                    f"MAVROS setpoint_velocity mav_frame={frame} failed: {exc}"
+                )
+            return
+
+        if elapsed >= self.mode_confirm_timeout_sec:
+            self._finish_mav_frame_switch_failure(
+                f"MAVROS setpoint_velocity mav_frame={frame} did not complete within {elapsed:.1f}s"
+            )
+
+    def _clear_pending_mav_frame_switch(self):
+        self._pending_mav_frame = None
+        self._pending_mav_frame_next_phase = None
+        self._pending_mav_frame_future = None
+        self._pending_mav_frame_started = None
+        self._pending_mav_frame_request_sent = False
+
+    def _finish_mav_frame_switch_failure(self, reason: str):
+        self._clear_pending_mav_frame_switch()
+        self.get_logger().error(reason)
+        self._publish_event("mav_frame_switch_failed")
         self._publish_velocity(0.0, 0.0, 0.0)
         if self._is_takeoff_land_mode():
             self._report_takeoff_land_result(reason)

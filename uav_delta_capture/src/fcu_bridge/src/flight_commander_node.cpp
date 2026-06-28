@@ -1,9 +1,12 @@
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <condition_variable>
 #include <functional>
+#include <set>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 
 #include <geometry_msgs/msg/twist_stamped.hpp>
@@ -36,7 +39,8 @@ public:
     use_mock_(declare_parameter<bool>("use_mock", false)),
     max_vel_xy_(declare_parameter<double>("max_vel_xy", 1.0)),
     max_vel_z_(declare_parameter<double>("max_vel_z", 0.5)),
-    skip_ekf_check_(declare_parameter<bool>("skip_ekf_check", false))
+    skip_ekf_check_(declare_parameter<bool>("skip_ekf_check", false)),
+    auto_vel_modes_(parseModes(declare_parameter<std::string>("auto_vel_modes", "GUIDED")))
   {
     vel_forward_rate_hz_ = std::max(1.0, vel_forward_rate_hz_);
     vel_timeout_sec_ = std::max(0.05, vel_timeout_sec_);
@@ -350,7 +354,15 @@ private:
     clamped->header.frame_id = last_vel_->header.frame_id.empty() ? "body" : last_vel_->header.frame_id;
 
     const double age = (now() - last_vel_time_).seconds();
-    if (age > vel_timeout_sec_) {
+    if (!velocityForwardingAllowed()) {
+      clamped->twist.linear.x = 0.0;
+      clamped->twist.linear.y = 0.0;
+      clamped->twist.linear.z = 0.0;
+      clamped->twist.angular.z = 0.0;
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "Velocity forwarding blocked by FCU mode/state, publishing zero setpoint");
+    } else if (age > vel_timeout_sec_) {
       clamped->twist.linear.x = 0.0;
       clamped->twist.linear.y = 0.0;
       clamped->twist.linear.z = 0.0;
@@ -366,6 +378,47 @@ private:
     }
 
     vel_pub_->publish(*clamped);
+  }
+
+  bool velocityForwardingAllowed() const
+  {
+    if (!has_state_ || !last_state_) {
+      return false;
+    }
+    if (!last_state_->armed) {
+      return false;
+    }
+    return auto_vel_modes_.count(toUpper(last_state_->mode)) > 0;
+  }
+
+  static std::string toUpper(std::string value)
+  {
+    for (char & c : value) {
+      c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return value;
+  }
+
+  static std::set<std::string> parseModes(const std::string & text)
+  {
+    std::set<std::string> modes;
+    std::stringstream ss(text);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+      std::string cleaned;
+      for (char c : item) {
+        if (!std::isspace(static_cast<unsigned char>(c))) {
+          cleaned.push_back(c);
+        }
+      }
+      if (!cleaned.empty()) {
+        modes.insert(toUpper(cleaned));
+      }
+    }
+    if (modes.empty()) {
+      modes.insert("GUIDED");
+    }
+    return modes;
   }
 
   static double clamp(double val, double lo, double hi)
@@ -388,6 +441,7 @@ private:
   double max_vel_xy_;
   double max_vel_z_;
   bool skip_ekf_check_;
+  std::set<std::string> auto_vel_modes_;
 
   // Callback group (reentrant to allow nested async service calls)
   rclcpp::CallbackGroup::SharedPtr cb_group_;

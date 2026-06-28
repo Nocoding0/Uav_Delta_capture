@@ -139,7 +139,7 @@ TAKEOFF_LOITER_LAND RESULT: PASS
 
 ### 4.2 上桨 GUIDED 定位前进降落测试
 
-用途：UWB 暂不可用时，先验证飞控本地位置 `/mavros/local_position/pose` 是否能支持短距离自主位移。流程是 `GUIDED` takeoff 起飞，到 `0.6m` 相对高度后先悬停稳定，再把 MAVROS setpoint velocity 切到 `BODY_NED`，按机体系 X 正方向低速前进；前进停止条件不是固定时间，而是 local_position 水平位移达到约 `0.60m`，随后在前方点悬停 2 秒并自动 `LAND`。
+用途：UWB 暂不可用时，先验证飞控本地位置 `/mavros/local_position/pose` 是否能支持短距离自主位移。流程是 `GUIDED` takeoff 起飞，到 `0.7m` 相对高度后先悬停稳定，再把 MAVROS setpoint velocity 切到 `BODY_NED`，按机体系 X 正方向前进；前进停止条件不是固定时间，而是 local_position 水平位移达到约 `1.0m`，随后在前方点悬停 2 秒并自动 `LAND`。
 
 前置：简单起降已 PASS，`/mavros/local_position/pose`、测距、光流均为 OK。该模式不启动 UWB driver，不读取 `/dev/ttySTM1`，不要求 `UWB=OK`。
 
@@ -174,7 +174,54 @@ Forward target hover stable, landing
 TAKEOFF_FORWARD_LAND RESULT: PASS
 ```
 
-如果 `FORWARD timeout`，说明 local_position 位移没有按预期增长，先检查光流、测距、EKF 和地面纹理，不要加大速度硬飞。日志里的 `cmd_body=(0.12,0.00,...)` 表示机体系前向速度；如果仍然不随机头方向飞，先确认 `mav_frame` 是否仍是 `BODY_NED`。
+如果 `FORWARD timeout`，说明 local_position 位移没有按预期增长，先检查光流、测距、EKF 和地面纹理，不要加大速度硬飞。日志里的 `cmd_body=(0.40,0.00,...)` 表示机体系前向速度；如果仍然不随机头方向飞，先确认 `mav_frame` 是否仍是 `BODY_NED`。
+
+### 4.3 上桨 GUIDED 航点往返降落测试
+
+用途：在不依赖 UWB 的情况下，验证飞控本地坐标能否支持“记录起点、按机体方向飞出、目标点下降悬停、复飞、返回起点、降落”。去程把 MAVROS `setpoint_velocity` 切到 `BODY_NED`，所以 `waypoint_dx/waypoint_dy` 表示机体系前/右；去程停止条件是 `/mavros/local_position/pose` 水平位移达到目标距离。目标点悬停后先下降到 `descend_altitude`，低位悬停 `low_hover_time`，再复飞到 `takeoff_altitude`，稳住后把 `mav_frame` 切到 `LOCAL_NED`，按 local 坐标闭环平移回起点附近。
+
+默认参数：起飞相对高度 `0.7m`，目标点低位高度 `0.5m`，低位悬停 `4.0s`；目标点偏移 `waypoint_dx=1.0m`、`waypoint_dy=0.0m`，含义是“起飞时机头前方 1m、右方 0m”；目标点和起点容差 `0.20m`，最大水平速度 `0.30m/s`。如果要测斜对角，先确认一维往返稳定，再把 `test_mission_takeoff_waypoint_return_land.yaml` 里的 `waypoint_dy` 改成 `1.0` 并重新编译。
+
+飞行前建议确认 MAVROS 速度坐标系初始已经被 launch 切成机体系：
+
+```bash
+docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && ros2 param get /mavros/setpoint_velocity mav_frame"
+```
+
+期望输出：
+
+```text
+String value is: BODY_NED
+```
+
+```bash
+docker exec -it ros2humble bash -lc "
+  source /opt/ros/humble/setup.bash
+  source /workspace/uav_delta_capture/install/setup.bash
+  ros2 launch uwb_navigation test_mission_takeoff_waypoint_return_land.launch.py
+"
+```
+
+关键通过标志：
+
+```text
+Takeoff OK
+Phase: HOVER_TAKEOFF -> WAYPOINT_OUTBOUND
+Waypoint outbound moving:
+Waypoint outbound reached
+Phase: HOVER_WAYPOINT -> WAYPOINT_DESCEND
+Waypoint descending:
+Phase: WAYPOINT_DESCEND -> HOVER_WAYPOINT_LOW
+Waypoint low hover holding
+Phase: HOVER_WAYPOINT_LOW -> WAYPOINT_RECLIMB
+Waypoint reclimbing:
+Phase: WAYPOINT_RECLIMB -> HOVER_WAYPOINT_RECLIMB
+MAVROS setpoint_velocity mav_frame confirmed: LOCAL_NED
+Waypoint return moving:
+Waypoint return reached
+Home hover stable, landing
+TAKEOFF_WAYPOINT_RETURN_LAND RESULT: PASS
+```
 
 ## 5. 上桨 UWB 接近降落精简测试
 

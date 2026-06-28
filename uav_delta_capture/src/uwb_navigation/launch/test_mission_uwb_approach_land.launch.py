@@ -4,7 +4,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import EmitEvent, RegisterEventHandler
+from launch.actions import EmitEvent, ExecuteProcess, RegisterEventHandler
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch_ros.actions import Node
@@ -18,6 +18,18 @@ def generate_launch_description():
         executable='test_mission_node.py',
         name='test_mission_node',
         parameters=[os.path.join(share_dir, 'test_mission_uwb_approach_land.yaml')],
+        output='screen',
+    )
+
+    set_body_frame = ExecuteProcess(
+        cmd=[
+            'ros2',
+            'param',
+            'set',
+            '/mavros/setpoint_velocity',
+            'mav_frame',
+            'BODY_NED',
+        ],
         output='screen',
     )
 
@@ -38,7 +50,8 @@ def generate_launch_description():
             name='flight_commander_node',
             parameters=[{
                 'skip_ekf_check': True,
-                'vel_timeout_sec': 0.5,
+                'vel_timeout_sec': 0.15,
+                'auto_vel_modes': 'GUIDED',
                 'takeoff_target_clearance_m': 0.2,
             }],
         ),
@@ -51,9 +64,15 @@ def generate_launch_description():
             package='uwb_driver',
             executable='uwb_aoa_driver_node',
             name='uwb_aoa_driver_node',
-            parameters=[{'serial_port': '/dev/ttySTM1', 'serial_baud': 115200}],
+            parameters=[{'serial_port': '/dev/ttyUSB0', 'serial_baud': 115200}],
         ),
-        test_mission_node,
+        set_body_frame,
+        RegisterEventHandler(
+            OnProcessExit(
+                target_action=set_body_frame,
+                on_exit=[test_mission_node],
+            )
+        ),
         RegisterEventHandler(
             OnProcessExit(
                 target_action=test_mission_node,
