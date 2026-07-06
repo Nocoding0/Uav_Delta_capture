@@ -38,7 +38,7 @@ source /workspace/uav_delta_capture/install/setup.bash
 | `bench_velocity` | `test_mission_bench.launch.py` | `test_mission_bench.yaml` | FCU 必需，UWB/测距/光流/本地位置仅监测 | 不上桨叶，ARM 后发送 Z 轴速度曲线再 DISARM |
 | `takeoff_forward_land` | `test_mission_takeoff_forward_land.launch.py` | `test_mission_takeoff_forward_land.yaml` | FCU、测距、光流、本地位置 | 低高度 GUIDED 起飞、按起飞时机头方向移动约 1.0m、悬停、降落 |
 | `takeoff_waypoint_return_land` | `test_mission_takeoff_waypoint_return_land.launch.py` | `test_mission_takeoff_waypoint_return_land.yaml` | FCU、测距、光流、本地位置 | 低高度 GUIDED 起飞、按起飞时机头方向定义目标点、返回起点、降落 |
-| `uwb_approach_land` | `test_mission_uwb_approach_land.launch.py` | `test_mission_uwb_approach_land.yaml` | 完整硬件 | 低高度 GUIDED 起飞、UWB 接近 tag 上方、悬停、原地降落 |
+| `uwb_approach_land` | `test_mission_uwb_approach_land.launch.py` | `test_mission_uwb_approach_land.yaml` | 完整硬件 | 低高度速度起飞、UWB 接近 tag 上方；目标不在前向扇区时原地偏航扫描，捕获后悬停降落 |
 | `real_full` | `test_mission_real_full.launch.py` | `test_mission_real.yaml` | 完整硬件 | 完整起飞、UWB 接近、下降、抓取占位、返航、投放占位、降落 |
 
 `test_mission_real.launch.py` 目前是兼容旧命名的 bench 入口，实际等价于 `test_mission_bench.launch.py`。
@@ -454,7 +454,7 @@ GUIDED 定位前进测试使用 `test_mission_takeoff_forward_land.launch.py`。
 
 GUIDED 航点往返测试使用 `test_mission_takeoff_waypoint_return_land.launch.py`。它沿用同一套 MAVROS takeoff 逻辑，到达低高度后先把 MAVROS `setpoint_velocity` 的 `mav_frame` 切到 `BODY_NED`，让 `waypoint_dx/waypoint_dy` 按机体系前/右解释；去程用 local_position 水平位移判定到点。目标点悬停后先下降到 `descend_altitude`，低位悬停 `low_hover_time`，再复飞到 `takeoff_altitude` 并稳住；随后节点把 `mav_frame` 切到 `LOCAL_NED`，按 local 坐标闭环平移回起点附近，最后 `LAND`。该测试不主动调转机头，用于验证光流/测距融合得到的 local_position 是否能支撑“去目标点、降落接近、复飞、回起点”。
 
-UWB 接近降落精简测试使用 `test_mission_uwb_approach_land.launch.py`。它沿用简单起降的 MAVROS takeoff 逻辑，到达低高度后保持 `GUIDED`，使用 UWB 方位和距离低速移动到 tag 上方，悬停确认后直接 `LAND`。这个测试不做抓取、复飞、返航、投放，是 `real_full` 前的上桨过渡入口。
+UWB 接近降落精简测试使用 `test_mission_uwb_approach_land.launch.py`。它在 `GUIDED` 下用测距相对高度执行低速起飞，避免 MAVROS 本地高度偏置导致先升高再回落；随后用 UWB 的直线距离、水平角和俯仰角解算机体系相对区间，再决定动作。UWB base 前下俯安装可通过 `uwb_mount_pitch_down_deg` 做机体系补偿，当前 staged 标定使用 `uwb_lateral_sign=-1.0` 把 UWB 横向方向校准到 BODY_NED。任务会按 27 点标定观察到的特征把目标分为 `FRONT_APPROACH`、`NEAR_CENTER_HOLD`、`CENTER_CAPTURE`、`SIDE_REAR_SCAN` 和 `INVALID_HOLD`：只有目标在严格前方窗口内稳定后才锁定直线接近，锁定后水平命令固定为机体系 X 正方向、`vy=0`，不再追随后续 UWB 横向漂移；已经前向稳定接近后，若读数进入高俯仰角、小水平分量且前后分量也足够小的近中心区间，则慢速补前或保持高度并允许捕获降落，不再因为正下方方位角发散而自旋；侧后方、前方但未对准，或几何俯仰短时无效但配置为 `SCAN` 时，进入固定方向偏航扫描，扫描锁定也要求角度进入严格前方窗口。这个测试不做抓取、复飞、返航、投放，是 `real_full` 前的上桨过渡入口。
 
 如果失败：
 
@@ -697,6 +697,13 @@ docker restart ros2humble
 | `target_hover_time` | `takeoff_forward_land` 到达目标位移后的悬停时间 |
 | `move_above_timeout_sec` | UWB 接近阶段最长持续时间，超时后进入安全降落 |
 | `uwb_missing_timeout_sec` | UWB 接近阶段允许 UWB 数据连续丢失的最长时间 |
+| `uwb_region_classifier_enabled` | `uwb_approach_land` 是否启用基于 27 点标定特征的 UWB 相对区间判别 |
+| `uwb_center_hold_hdist_m` / `uwb_center_capture_hdist_m` | 已经前向稳定接近后，近中心悬停和捕获使用的水平分量阈值 |
+| `uwb_front_line_lock_deg` | `uwb_approach_land` 前方直线锁定和扫描锁定使用的严格前方角度窗口 |
+| `uwb_center_creep_speed_mps` | 已直线锁定且近中心但仍在 tag 前方时允许的低速前向补偿速度 |
+| `uwb_scan_settle_sec` | 进入 UWB 偏航扫描后先发布零 yaw/零 XY 的稳定等待时间 |
+| `uwb_center_max_abs_forward_m` | 近中心判别允许的最大前后分量，用来避免把后方高俯仰角误判成正上方 |
+| `uwb_center_min_body_elevation_deg` / `uwb_center_capture_body_elevation_deg` | 近中心悬停和捕获要求的机体系俯仰角阈值 |
 | `bench_velocity_z` | bench 阶段 Z 轴速度指令幅值 |
 | `bench_climb_sec` / `bench_hold_sec` / `bench_descend_sec` / `bench_zero_sec` | bench 速度曲线各阶段时长 |
 | `bench_sensor_timeout` | bench 自检判断传感器消息是否新鲜的超时时间 |

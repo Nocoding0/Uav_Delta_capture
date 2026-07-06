@@ -19,7 +19,7 @@ test_mission_node:
     desktop_test: false
     arm_mode: ALT_HOLD
 
-    # Proven GUIDED takeoff/land baseline plus a conservative UWB approach.
+    # UWB staged test: MAVROS takeoff plus a conservative UWB approach.
     takeoff_altitude: 0.6
     takeoff_method: mavros
     takeoff_climb_velocity: 0.12
@@ -42,19 +42,43 @@ test_mission_node:
     azimuth_deadband: 5.0
     horizontal_deadband: 0.25
     # BODY_NED UWB approach mapping:
-    # azimuth_offset subtracts fixed UWB mounting yaw; signs are quick field calibration knobs.
+    # azimuth_offset subtracts fixed UWB mounting yaw; mount_pitch_down rotates the UWB base
+    # vector into the UAV body frame when the base points forward-down.
+    # signs calibrate the UWB base vector into UAV BODY_NED before azimuth,
+    # capture, scan-lock, and velocity calculations.
     uwb_azimuth_offset_deg: 0.0
+    uwb_mount_pitch_down_deg: -45.0
     uwb_forward_sign: 1.0
-    uwb_lateral_sign: 1.0
-    uwb_capture_radius_m: 0.55
+    uwb_lateral_sign: -1.0
+    uwb_capture_radius_m: 0.25
+    uwb_near_capture_min_body_elevation_deg: 65.0
+    uwb_near_capture_radius_m: 0.25
+    uwb_near_capture_stable_sec: 0.8
+    uwb_region_classifier_enabled: true
+    uwb_region_window_sec: 0.4
+    uwb_center_min_body_elevation_deg: 60.0
+    uwb_center_capture_body_elevation_deg: 65.0
+    uwb_center_hold_hdist_m: 0.65
+    uwb_center_capture_hdist_m: 0.35
+    uwb_center_max_abs_forward_m: 0.20
+    uwb_center_stable_sec: 0.8
+    uwb_center_creep_speed_mps: 0.04
     uwb_slow_radius_m: 1.0
-    uwb_slow_max_vel_xy: 0.08
+    uwb_slow_max_vel_xy: 0.06
     uwb_target_hover_time_sec: 0.8
     uwb_approach_front_sector_deg: 65.0
-    uwb_capture_front_sector_deg: 55.0
+    uwb_capture_front_sector_deg: 30.0
     uwb_front_sector_timeout_sec: 2.0
-    uwb_capture_stable_sec: 0.3
-    uwb_out_of_front_action: LAND
+    uwb_capture_stable_sec: 0.8
+    uwb_front_stable_sec: 0.5
+    uwb_front_line_lock_deg: 15.0
+    uwb_min_body_elevation_deg: 8.0
+    uwb_out_of_front_action: SCAN
+    uwb_scan_yaw_rate_deg_s: 12.0
+    uwb_scan_timeout_sec: 30.0
+    uwb_scan_lock_front_sector_deg: 15.0
+    uwb_scan_lock_stable_sec: 0.5
+    uwb_scan_settle_sec: 0.5
     mission_soft_radius_m: 2.0
     mission_hard_radius_m: 2.5
     move_above_timeout_sec: 20.0

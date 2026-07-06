@@ -24,6 +24,7 @@ install(TARGETS
 
 install(PROGRAMS
   src/test_mission_node.py
+  src/uwb_calibration_recorder.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

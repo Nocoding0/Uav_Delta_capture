@@ -71,6 +71,7 @@ class Phase(Enum):
     HOVER_WAYPOINT_LOW = 29
     WAYPOINT_RECLIMB = 30
     HOVER_WAYPOINT_RECLIMB = 31
+    UWB_SCAN_YAW = 32
 
 
 PHASE_NAMES = {phase: phase.name for phase in Phase}
@@ -171,6 +172,9 @@ class TestMissionNode(Node):
         self.azimuth_deadband = self.declare_parameter("azimuth_deadband", 3.0).value
         self.horizontal_deadband = self.declare_parameter("horizontal_deadband", 0.15).value
         self.uwb_azimuth_offset_deg = self.declare_parameter("uwb_azimuth_offset_deg", 0.0).value
+        self.uwb_mount_pitch_down_deg = self.declare_parameter(
+            "uwb_mount_pitch_down_deg", 0.0
+        ).value
         self.uwb_forward_sign = self.declare_parameter("uwb_forward_sign", 1.0).value
         self.uwb_lateral_sign = self.declare_parameter("uwb_lateral_sign", 1.0).value
         self.uwb_capture_radius_m = self.declare_parameter("uwb_capture_radius_m", 0.55).value
@@ -185,14 +189,74 @@ class TestMissionNode(Node):
         self.uwb_capture_front_sector_deg = self.declare_parameter(
             "uwb_capture_front_sector_deg", 55.0
         ).value
+        self.uwb_near_capture_min_body_elevation_deg = self.declare_parameter(
+            "uwb_near_capture_min_body_elevation_deg", 65.0
+        ).value
+        self.uwb_near_capture_radius_m = self.declare_parameter(
+            "uwb_near_capture_radius_m", 0.25
+        ).value
+        self.uwb_near_capture_stable_sec = self.declare_parameter(
+            "uwb_near_capture_stable_sec", 0.8
+        ).value
+        self.uwb_region_classifier_enabled = self.declare_parameter(
+            "uwb_region_classifier_enabled", True
+        ).value
+        self.uwb_region_window_sec = self.declare_parameter(
+            "uwb_region_window_sec", 0.4
+        ).value
+        self.uwb_center_min_body_elevation_deg = self.declare_parameter(
+            "uwb_center_min_body_elevation_deg", 60.0
+        ).value
+        self.uwb_center_capture_body_elevation_deg = self.declare_parameter(
+            "uwb_center_capture_body_elevation_deg", 65.0
+        ).value
+        self.uwb_center_hold_hdist_m = self.declare_parameter(
+            "uwb_center_hold_hdist_m", 0.65
+        ).value
+        self.uwb_center_capture_hdist_m = self.declare_parameter(
+            "uwb_center_capture_hdist_m", 0.45
+        ).value
+        self.uwb_center_max_abs_forward_m = self.declare_parameter(
+            "uwb_center_max_abs_forward_m", 0.35
+        ).value
+        self.uwb_center_stable_sec = self.declare_parameter(
+            "uwb_center_stable_sec", 0.8
+        ).value
         self.uwb_front_sector_timeout_sec = self.declare_parameter(
             "uwb_front_sector_timeout_sec", 2.0
         ).value
         self.uwb_capture_stable_sec = self.declare_parameter(
             "uwb_capture_stable_sec", 0.3
         ).value
+        self.uwb_front_stable_sec = self.declare_parameter(
+            "uwb_front_stable_sec", 0.5
+        ).value
+        self.uwb_front_line_lock_deg = self.declare_parameter(
+            "uwb_front_line_lock_deg", 15.0
+        ).value
+        self.uwb_center_creep_speed_mps = self.declare_parameter(
+            "uwb_center_creep_speed_mps", 0.04
+        ).value
+        self.uwb_min_body_elevation_deg = self.declare_parameter(
+            "uwb_min_body_elevation_deg", 8.0
+        ).value
         self.uwb_out_of_front_action = self.declare_parameter(
             "uwb_out_of_front_action", "LAND"
+        ).value
+        self.uwb_scan_yaw_rate_deg_s = self.declare_parameter(
+            "uwb_scan_yaw_rate_deg_s", 20.0
+        ).value
+        self.uwb_scan_timeout_sec = self.declare_parameter(
+            "uwb_scan_timeout_sec", 10.0
+        ).value
+        self.uwb_scan_lock_front_sector_deg = self.declare_parameter(
+            "uwb_scan_lock_front_sector_deg", 45.0
+        ).value
+        self.uwb_scan_lock_stable_sec = self.declare_parameter(
+            "uwb_scan_lock_stable_sec", 0.5
+        ).value
+        self.uwb_scan_settle_sec = self.declare_parameter(
+            "uwb_scan_settle_sec", 0.5
         ).value
         self.mission_soft_radius_m = self.declare_parameter("mission_soft_radius_m", 2.0).value
         self.mission_hard_radius_m = self.declare_parameter("mission_hard_radius_m", 2.5).value
@@ -296,17 +360,83 @@ class TestMissionNode(Node):
             abs(float(self.uwb_slow_max_vel_xy)), 0.02, self.max_vel_xy
         )
         self.uwb_target_hover_time_sec = max(0.1, float(self.uwb_target_hover_time_sec))
+        self.uwb_mount_pitch_down_deg = clamp(
+            float(self.uwb_mount_pitch_down_deg), -89.0, 89.0
+        )
+        self.uwb_forward_sign = -1.0 if float(self.uwb_forward_sign) < 0.0 else 1.0
+        self.uwb_lateral_sign = -1.0 if float(self.uwb_lateral_sign) < 0.0 else 1.0
         self.uwb_approach_front_sector_deg = clamp(
             abs(float(self.uwb_approach_front_sector_deg)), 5.0, 179.0
         )
         self.uwb_capture_front_sector_deg = clamp(
             abs(float(self.uwb_capture_front_sector_deg)), 3.0, self.uwb_approach_front_sector_deg
         )
+        self.uwb_near_capture_min_body_elevation_deg = clamp(
+            float(self.uwb_near_capture_min_body_elevation_deg),
+            self.uwb_min_body_elevation_deg,
+            89.0,
+        )
+        self.uwb_near_capture_radius_m = max(
+            self.uwb_capture_radius_m,
+            float(self.uwb_near_capture_radius_m),
+        )
+        self.uwb_near_capture_stable_sec = max(
+            0.0,
+            float(self.uwb_near_capture_stable_sec),
+        )
+        self.uwb_region_classifier_enabled = bool(self.uwb_region_classifier_enabled)
+        self.uwb_region_window_sec = max(0.0, float(self.uwb_region_window_sec))
+        self.uwb_center_min_body_elevation_deg = clamp(
+            float(self.uwb_center_min_body_elevation_deg),
+            self.uwb_min_body_elevation_deg,
+            89.0,
+        )
+        self.uwb_center_capture_body_elevation_deg = clamp(
+            float(self.uwb_center_capture_body_elevation_deg),
+            self.uwb_center_min_body_elevation_deg,
+            89.0,
+        )
+        self.uwb_center_hold_hdist_m = max(0.05, float(self.uwb_center_hold_hdist_m))
+        self.uwb_center_capture_hdist_m = clamp(
+            float(self.uwb_center_capture_hdist_m),
+            0.05,
+            self.uwb_center_hold_hdist_m,
+        )
+        self.uwb_center_max_abs_forward_m = max(
+            0.05,
+            float(self.uwb_center_max_abs_forward_m),
+        )
+        self.uwb_center_stable_sec = max(0.0, float(self.uwb_center_stable_sec))
         self.uwb_front_sector_timeout_sec = max(0.2, float(self.uwb_front_sector_timeout_sec))
         self.uwb_capture_stable_sec = max(0.0, float(self.uwb_capture_stable_sec))
+        self.uwb_front_stable_sec = max(0.0, float(self.uwb_front_stable_sec))
+        self.uwb_front_line_lock_deg = clamp(
+            abs(float(self.uwb_front_line_lock_deg)),
+            3.0,
+            self.uwb_approach_front_sector_deg,
+        )
+        self.uwb_center_creep_speed_mps = clamp(
+            abs(float(self.uwb_center_creep_speed_mps)),
+            0.0,
+            self.max_vel_xy,
+        )
+        self.uwb_min_body_elevation_deg = clamp(
+            float(self.uwb_min_body_elevation_deg), -89.0, 89.0
+        )
         self.uwb_out_of_front_action = str(self.uwb_out_of_front_action).strip().upper()
-        if self.uwb_out_of_front_action not in ("LAND", "HOVER"):
+        if self.uwb_out_of_front_action not in ("LAND", "HOVER", "SCAN"):
             self.uwb_out_of_front_action = "LAND"
+        self.uwb_scan_yaw_rate_deg_s = clamp(
+            abs(float(self.uwb_scan_yaw_rate_deg_s)), 5.0, 60.0
+        )
+        self.uwb_scan_timeout_sec = max(1.0, float(self.uwb_scan_timeout_sec))
+        self.uwb_scan_lock_front_sector_deg = clamp(
+            abs(float(self.uwb_scan_lock_front_sector_deg)),
+            3.0,
+            self.uwb_approach_front_sector_deg,
+        )
+        self.uwb_scan_lock_stable_sec = max(0.0, float(self.uwb_scan_lock_stable_sec))
+        self.uwb_scan_settle_sec = max(0.0, float(self.uwb_scan_settle_sec))
         self.mission_soft_radius_m = max(0.1, float(self.mission_soft_radius_m))
         self.mission_hard_radius_m = max(self.mission_soft_radius_m, float(self.mission_hard_radius_m))
         self.forward_target_distance = max(0.05, float(self.forward_target_distance))
@@ -402,7 +532,17 @@ class TestMissionNode(Node):
         self._uwb_missing_start_time = None
         self._uwb_out_of_front_start_time = None
         self._uwb_capture_start_time = None
+        self._uwb_capture_mode = None
+        self._uwb_front_start_time = None
+        self._uwb_front_stable_once = False
+        self._uwb_front_line_locked = False
+        self._uwb_region_samples = []
+        self._uwb_region_hold_start_time = None
+        self._uwb_last_region = None
         self._uwb_target_captured = False
+        self._uwb_scan_start_time = None
+        self._uwb_scan_lock_start_time = None
+        self._uwb_scan_direction = 1.0
         self._forward_start_time = None
         self._forward_start_xy = None
         self._waypoint_start_time = None
@@ -535,6 +675,7 @@ class TestMissionNode(Node):
             Phase.TAKEOFF: self._tick_takeoff,
             Phase.HOVER_TAKEOFF: self._tick_hover_takeoff,
             Phase.MOVE_ABOVE: self._tick_move_above,
+            Phase.UWB_SCAN_YAW: self._tick_uwb_scan_yaw,
             Phase.HOVER_ABOVE: self._tick_hover_above,
             Phase.DESCEND: self._tick_descend,
             Phase.HOVER_FINAL: self._tick_hover_final,
@@ -695,6 +836,133 @@ class TestMissionNode(Node):
             if uwb is None:
                 return None
             return (uwb.azimuth_deg, uwb.distance_m, uwb.elevation_deg)
+
+    def _uwb_body_geometry(self, raw_azimuth, distance, elevation):
+        azimuth_base = raw_azimuth - self.uwb_azimuth_offset_deg
+        az_rad = math.radians(azimuth_base)
+        el_rad = math.radians(elevation)
+        pitch_rad = math.radians(self.uwb_mount_pitch_down_deg)
+
+        x_base = distance * math.cos(el_rad) * math.cos(az_rad)
+        y_base = distance * math.cos(el_rad) * math.sin(az_rad)
+        z_base = distance * math.sin(el_rad)
+
+        cos_p = math.cos(pitch_rad)
+        sin_p = math.sin(pitch_rad)
+        x_body = cos_p * x_base + sin_p * z_base
+        y_body = y_base
+        z_body = -sin_p * x_base + cos_p * z_base
+
+        x_body *= self.uwb_forward_sign
+        y_body *= self.uwb_lateral_sign
+
+        horizontal_dist = math.sqrt(x_body * x_body + y_body * y_body)
+        body_azimuth = math.degrees(math.atan2(y_body, x_body))
+        body_elevation = math.degrees(math.atan2(z_body, horizontal_dist))
+
+        return {
+            "body_azimuth": body_azimuth,
+            "body_elevation": body_elevation,
+            "horizontal_dist": horizontal_dist,
+            "forward_dist": x_body,
+            "lateral_dist": y_body,
+            "vertical_dist": z_body,
+        }
+
+    def _uwb_smoothed_geometry(self, now, raw_azimuth, distance, elevation):
+        geom = self._uwb_body_geometry(raw_azimuth, distance, elevation)
+        if not self.uwb_region_classifier_enabled or self.uwb_region_window_sec <= 0.0:
+            geom["raw_azimuth"] = raw_azimuth
+            geom["distance"] = distance
+            geom["elevation"] = elevation
+            return geom
+
+        now_sec = now.nanoseconds / 1e9
+        self._uwb_region_samples.append(
+            {
+                "time": now_sec,
+                "raw_azimuth": raw_azimuth,
+                "distance": distance,
+                "elevation": elevation,
+                **geom,
+            }
+        )
+        cutoff = now_sec - self.uwb_region_window_sec
+        self._uwb_region_samples = [
+            sample for sample in self._uwb_region_samples if sample["time"] >= cutoff
+        ]
+        samples = self._uwb_region_samples
+        if not samples:
+            geom["raw_azimuth"] = raw_azimuth
+            geom["distance"] = distance
+            geom["elevation"] = elevation
+            return geom
+
+        smoothed = {}
+        for key in (
+            "distance",
+            "elevation",
+            "body_elevation",
+            "horizontal_dist",
+            "forward_dist",
+            "lateral_dist",
+            "vertical_dist",
+        ):
+            smoothed[key] = sum(sample[key] for sample in samples) / len(samples)
+
+        sin_sum = sum(math.sin(math.radians(sample["raw_azimuth"])) for sample in samples)
+        cos_sum = sum(math.cos(math.radians(sample["raw_azimuth"])) for sample in samples)
+        smoothed["raw_azimuth"] = math.degrees(math.atan2(sin_sum, cos_sum))
+        smoothed["body_azimuth"] = math.degrees(
+            math.atan2(smoothed["lateral_dist"], smoothed["forward_dist"])
+        )
+        return smoothed
+
+    def _uwb_classify_region(self, geom):
+        body_elevation = geom["body_elevation"]
+        horizontal_dist = geom["horizontal_dist"]
+        forward_dist = geom["forward_dist"]
+        lateral_dist = geom["lateral_dist"]
+        azimuth = geom["body_azimuth"]
+
+        if body_elevation < self.uwb_min_body_elevation_deg:
+            return "INVALID_HOLD", "body_elevation_below_min"
+
+        # 27-point calibration showed center data can have arbitrary azimuth.
+        # Treat high elevation plus small horizontal component as near-center
+        # only after a front approach was already observed.
+        if self._uwb_front_stable_once:
+            if (
+                body_elevation >= self.uwb_center_capture_body_elevation_deg
+                and horizontal_dist <= self.uwb_center_capture_hdist_m
+                and abs(forward_dist) <= self.uwb_center_max_abs_forward_m
+            ):
+                return "CENTER_CAPTURE", "center_high_elevation_close"
+            if (
+                body_elevation >= self.uwb_center_min_body_elevation_deg
+                and horizontal_dist <= self.uwb_center_hold_hdist_m
+                and abs(forward_dist) <= self.uwb_center_max_abs_forward_m
+            ):
+                return "NEAR_CENTER_HOLD", "center_high_elevation_near"
+
+        front_ok = (
+            forward_dist > 0.0
+            and abs(azimuth) <= self.uwb_approach_front_sector_deg
+        )
+        if front_ok:
+            return "FRONT_APPROACH", "front_sector"
+
+        return "SIDE_REAR_SCAN", "outside_front_not_center"
+
+    def _uwb_update_region_hold(self, now, region):
+        if region != self._uwb_last_region:
+            self._uwb_region_hold_start_time = now
+            self._uwb_last_region = region
+            return 0.0
+        if self._uwb_region_hold_start_time is None:
+            self._uwb_region_hold_start_time = now
+            return 0.0
+        return (now - self._uwb_region_hold_start_time).nanoseconds / 1e9
 
     def _get_fcu_altitude(self) -> float:
         with self._data_lock:
@@ -1921,12 +2189,13 @@ class TestMissionNode(Node):
 
         self._uwb_missing_start_time = None
         raw_azimuth, distance, elevation = uwb
-        azimuth = raw_azimuth - self.uwb_azimuth_offset_deg
-        az_rad = azimuth * math.pi / 180.0
-        el_rad = elevation * math.pi / 180.0
-        horizontal_dist = abs(distance * math.cos(el_rad))
-        forward_dist = horizontal_dist * math.cos(az_rad)
-        lateral_dist = horizontal_dist * math.sin(az_rad)
+        geom = self._uwb_smoothed_geometry(now, raw_azimuth, distance, elevation)
+        azimuth = geom["body_azimuth"]
+        body_elevation = geom["body_elevation"]
+        horizontal_dist = geom["horizontal_dist"]
+        forward_dist = geom["forward_dist"]
+        lateral_dist = geom["lateral_dist"]
+        vertical_dist = geom["vertical_dist"]
 
         vx = 0.0
         vy = 0.0
@@ -1936,12 +2205,12 @@ class TestMissionNode(Node):
             speed_limit = min(speed_limit, self.uwb_slow_max_vel_xy)
         if horizontal_dist > stop_radius:
             vx = clamp(
-                self.uwb_forward_sign * self.kp_horizontal * forward_dist,
+                self.kp_horizontal * forward_dist,
                 -speed_limit,
                 speed_limit,
             )
             vy = clamp(
-                self.uwb_lateral_sign * self.kp_horizontal * lateral_dist,
+                self.kp_horizontal * lateral_dist,
                 -speed_limit,
                 speed_limit,
             )
@@ -1956,53 +2225,216 @@ class TestMissionNode(Node):
         vz = clamp(self.kp_vertical * alt_err, -self.max_vel_z, self.max_vel_z)
 
         radius = self._mission_xy_distance_from_origin()
+        region = "LEGACY"
+        region_reason = "legacy"
         if self._is_uwb_approach_land_mode():
-            front_ok = abs(azimuth) <= self.uwb_approach_front_sector_deg
-            capture_geometry_ok = (
+            region, region_reason = self._uwb_classify_region(geom)
+            region_elapsed = self._uwb_update_region_hold(now, region)
+            geometry_ok = region != "INVALID_HOLD"
+            if self._uwb_front_line_locked and geometry_ok and region == "SIDE_REAR_SCAN":
+                region = "FRONT_LINE_LOCKED"
+                region_reason = "front_line_locked_ignore_lateral"
+            front_region_ok = region == "FRONT_APPROACH"
+            tight_front_ok = (
+                front_region_ok
+                and abs(azimuth) <= self.uwb_front_line_lock_deg
+            )
+            normal_capture_geometry_ok = (
+                geometry_ok
+                and
                 horizontal_dist <= self.uwb_capture_radius_m
                 and abs(azimuth) <= self.uwb_capture_front_sector_deg
             )
-            if not front_ok:
+            center_capture_geometry_ok = region == "CENTER_CAPTURE"
+            capture_geometry_ok = normal_capture_geometry_ok or center_capture_geometry_ok
+            capture_mode = "center" if center_capture_geometry_ok and not normal_capture_geometry_ok else "normal"
+            if not geometry_ok:
                 self._uwb_capture_start_time = None
+                self._uwb_capture_mode = None
+                self._uwb_front_start_time = None
                 if self._uwb_out_of_front_start_time is None:
                     self._uwb_out_of_front_start_time = now
                 out_elapsed = (now - self._uwb_out_of_front_start_time).nanoseconds / 1e9
                 self._publish_velocity(0.0, 0.0, vz, frame_id="body", immediate=True)
                 self.get_logger().warn(
-                    f"UWB target outside front sector: az={azimuth:.1f}deg "
-                    f"raw_az={raw_azimuth:.1f}deg limit={self.uwb_approach_front_sector_deg:.1f}deg "
+                    f"UWB region={region} hold: reason={region_reason} "
+                    f"az={azimuth:.1f}deg raw_az={raw_azimuth:.1f}deg "
+                    f"raw_el={elevation:.1f}deg body_el={body_elevation:.1f}/"
+                    f"{self.uwb_min_body_elevation_deg:.1f}deg hdist={horizontal_dist:.2f}m "
+                    f"elapsed={out_elapsed:.1f}/{self.uwb_front_sector_timeout_sec:.1f}s",
+                    throttle_duration_sec=0.5,
+                )
+                if (
+                    out_elapsed >= self.uwb_front_sector_timeout_sec
+                    and self.uwb_out_of_front_action in ("LAND", "SCAN")
+                ):
+                    reason = (
+                        f"UWB geometry invalid for {out_elapsed:.1f}s "
+                        f"(body_el={body_elevation:.1f}deg, min={self.uwb_min_body_elevation_deg:.1f}deg)"
+                    )
+                    if self.uwb_out_of_front_action == "SCAN":
+                        self._uwb_scan_direction = -1.0 if azimuth < 0.0 else 1.0
+                        self._uwb_front_line_locked = False
+                        self.get_logger().warn(f"{reason}; starting yaw scan")
+                        self._publish_event("uwb_geometry_invalid_scan")
+                        self._transition(Phase.UWB_SCAN_YAW)
+                    else:
+                        self.get_logger().warn(f"{reason}; landing")
+                        self._publish_event("uwb_geometry_invalid_land")
+                        self._takeoff_land_abort_reason = reason
+                        self._transition(Phase.LAND)
+                return
+
+            if region == "NEAR_CENTER_HOLD":
+                self._uwb_capture_start_time = None
+                self._uwb_capture_mode = None
+                self._uwb_out_of_front_start_time = None
+                creep_vx = 0.0
+                action = "HOLD"
+                if (
+                    self._uwb_front_line_locked
+                    and forward_dist > self.uwb_capture_radius_m
+                    and self.uwb_center_creep_speed_mps > 0.0
+                ):
+                    creep_vx = min(self.uwb_center_creep_speed_mps, speed_limit)
+                    action = "CREEP_FORWARD"
+                self._publish_velocity(creep_vx, 0.0, vz, frame_id="body", immediate=True)
+                self.get_logger().info(
+                    f"UWB region={region}: reason={region_reason} "
+                    f"az={azimuth:.1f}deg raw_az={raw_azimuth:.1f}deg raw_el={elevation:.1f}deg "
+                    f"body_el={body_elevation:.1f}deg hdist={horizontal_dist:.2f}m "
+                    f"body_dist=({forward_dist:.2f},{lateral_dist:.2f},{vertical_dist:.2f}) "
+                    f"stable={region_elapsed:.1f}/{self.uwb_center_stable_sec:.1f}s "
+                    f"front_line_locked={self._uwb_front_line_locked} "
+                    f"action={action} cmd_body=({creep_vx:.2f},0.00,{vz:.2f})",
+                    throttle_duration_sec=0.5,
+                )
+                return
+
+            if region == "SIDE_REAR_SCAN":
+                self._uwb_capture_start_time = None
+                self._uwb_capture_mode = None
+                self._uwb_front_start_time = None
+                if self._uwb_out_of_front_start_time is None:
+                    self._uwb_out_of_front_start_time = now
+                out_elapsed = (now - self._uwb_out_of_front_start_time).nanoseconds / 1e9
+                self._publish_velocity(0.0, 0.0, vz, frame_id="body", immediate=True)
+                self.get_logger().warn(
+                    f"UWB region={region}: reason={region_reason} az={azimuth:.1f}deg "
+                    f"raw_az={raw_azimuth:.1f}deg raw_el={elevation:.1f}deg "
+                    f"limit={self.uwb_approach_front_sector_deg:.1f}deg "
                     f"hdist={horizontal_dist:.2f}m elapsed={out_elapsed:.1f}/"
                     f"{self.uwb_front_sector_timeout_sec:.1f}s action={self.uwb_out_of_front_action}",
                     throttle_duration_sec=0.5,
                 )
                 if (
                     out_elapsed >= self.uwb_front_sector_timeout_sec
-                    and self.uwb_out_of_front_action == "LAND"
+                    and self.uwb_out_of_front_action in ("LAND", "SCAN")
                 ):
                     reason = (
                         f"UWB target outside front sector for {out_elapsed:.1f}s "
                         f"(az={azimuth:.1f}deg, limit={self.uwb_approach_front_sector_deg:.1f}deg)"
                     )
-                    self.get_logger().warn(f"{reason}; landing")
-                    self._publish_event("uwb_out_of_front_land")
-                    self._takeoff_land_abort_reason = reason
-                    self._transition(Phase.LAND)
+                    if self.uwb_out_of_front_action == "SCAN":
+                        self._uwb_scan_direction = -1.0 if azimuth < 0.0 else 1.0
+                        self._uwb_front_line_locked = False
+                        self.get_logger().warn(f"{reason}; starting yaw scan")
+                        self._publish_event("uwb_out_of_front_scan")
+                        self._transition(Phase.UWB_SCAN_YAW)
+                    else:
+                        self.get_logger().warn(f"{reason}; landing")
+                        self._publish_event("uwb_out_of_front_land")
+                        self._takeoff_land_abort_reason = reason
+                        self._transition(Phase.LAND)
                 return
+
+            if front_region_ok and not tight_front_ok and not self._uwb_front_line_locked:
+                self._uwb_capture_start_time = None
+                self._uwb_capture_mode = None
+                self._uwb_front_start_time = None
+                if self._uwb_out_of_front_start_time is None:
+                    self._uwb_out_of_front_start_time = now
+                out_elapsed = (now - self._uwb_out_of_front_start_time).nanoseconds / 1e9
+                self._publish_velocity(0.0, 0.0, vz, frame_id="body", immediate=True)
+                self.get_logger().warn(
+                    f"UWB front sector but not line-aligned: az={azimuth:.1f}/"
+                    f"{self.uwb_front_line_lock_deg:.1f}deg raw_az={raw_azimuth:.1f}deg "
+                    f"raw_el={elevation:.1f}deg body_el={body_elevation:.1f}deg "
+                    f"hdist={horizontal_dist:.2f}m elapsed={out_elapsed:.1f}/"
+                    f"{self.uwb_front_sector_timeout_sec:.1f}s action={self.uwb_out_of_front_action}",
+                    throttle_duration_sec=0.5,
+                )
+                if (
+                    out_elapsed >= self.uwb_front_sector_timeout_sec
+                    and self.uwb_out_of_front_action in ("LAND", "SCAN")
+                ):
+                    reason = (
+                        f"UWB target not line-aligned for {out_elapsed:.1f}s "
+                        f"(az={azimuth:.1f}deg, lock={self.uwb_front_line_lock_deg:.1f}deg)"
+                    )
+                    if self.uwb_out_of_front_action == "SCAN":
+                        self._uwb_scan_direction = -1.0 if azimuth < 0.0 else 1.0
+                        self._uwb_front_line_locked = False
+                        self.get_logger().warn(f"{reason}; starting yaw scan")
+                        self._publish_event("uwb_front_not_aligned_scan")
+                        self._transition(Phase.UWB_SCAN_YAW)
+                    else:
+                        self.get_logger().warn(f"{reason}; landing")
+                        self._publish_event("uwb_front_not_aligned_land")
+                        self._takeoff_land_abort_reason = reason
+                        self._transition(Phase.LAND)
+                return
+
+            if tight_front_ok and not self._uwb_front_line_locked:
+                if self._uwb_front_start_time is None:
+                    self._uwb_front_start_time = now
+                    front_elapsed = 0.0
+                else:
+                    front_elapsed = (now - self._uwb_front_start_time).nanoseconds / 1e9
+                if front_elapsed < self.uwb_front_stable_sec:
+                    self._uwb_capture_start_time = None
+                    self._uwb_capture_mode = None
+                    self._publish_velocity(0.0, 0.0, vz, frame_id="body", immediate=True)
+                    self.get_logger().info(
+                        f"UWB front candidate: az={azimuth:.1f}deg raw_az={raw_azimuth:.1f}deg "
+                        f"raw_el={elevation:.1f}deg body_el={body_elevation:.1f}deg "
+                        f"hdist={horizontal_dist:.2f}m stable={front_elapsed:.1f}/"
+                        f"{self.uwb_front_stable_sec:.1f}s",
+                        throttle_duration_sec=0.2,
+                    )
+                    return
+                self._uwb_front_stable_once = True
+                self._uwb_front_line_locked = True
+                self.get_logger().info(
+                    f"UWB front line locked: az={azimuth:.1f}/"
+                    f"{self.uwb_front_line_lock_deg:.1f}deg raw_az={raw_azimuth:.1f}deg "
+                    f"raw_el={elevation:.1f}deg body_el={body_elevation:.1f}deg "
+                    f"hdist={horizontal_dist:.2f}m stable={front_elapsed:.1f}s"
+                )
 
             self._uwb_out_of_front_start_time = None
             if capture_geometry_ok:
-                if self._uwb_capture_start_time is None:
+                stable_required = (
+                    self.uwb_center_stable_sec
+                    if capture_mode == "center"
+                    else self.uwb_capture_stable_sec
+                )
+                if self._uwb_capture_start_time is None or self._uwb_capture_mode != capture_mode:
                     self._uwb_capture_start_time = now
+                    self._uwb_capture_mode = capture_mode
                     capture_elapsed = 0.0
                 else:
                     capture_elapsed = (now - self._uwb_capture_start_time).nanoseconds / 1e9
                 self._publish_velocity(0.0, 0.0, vz, frame_id="body", immediate=True)
-                if capture_elapsed < self.uwb_capture_stable_sec:
+                if capture_elapsed < stable_required:
                     self.get_logger().info(
-                        f"UWB target capture candidate: az={azimuth:.1f}deg "
-                        f"raw_az={raw_azimuth:.1f}deg el={elevation:.1f}deg "
-                        f"hdist={horizontal_dist:.2f}/{self.uwb_capture_radius_m:.2f}m "
-                        f"stable={capture_elapsed:.1f}/{self.uwb_capture_stable_sec:.1f}s",
+                        f"UWB region={region} {capture_mode} target capture candidate: "
+                        f"az={azimuth:.1f}deg "
+                        f"raw_az={raw_azimuth:.1f}deg raw_el={elevation:.1f}deg "
+                        f"body_el={body_elevation:.1f}deg "
+                        f"hdist={horizontal_dist:.2f}/"
+                        f"{self.uwb_center_capture_hdist_m if capture_mode == 'center' else self.uwb_capture_radius_m:.2f}m "
+                        f"stable={capture_elapsed:.1f}/{stable_required:.1f}s",
                         throttle_duration_sec=0.2,
                     )
                     return
@@ -2010,14 +2442,18 @@ class TestMissionNode(Node):
                 self._uwb_approach_ok = True
                 self._publish_event("uwb_target_captured")
                 self.get_logger().info(
-                    f"UWB target captured: az={azimuth:.1f}deg raw_az={raw_azimuth:.1f}deg "
-                    f"el={elevation:.1f}deg hdist={horizontal_dist:.2f}/"
-                    f"{self.uwb_capture_radius_m:.2f}m body_dist=({forward_dist:.2f},{lateral_dist:.2f}) "
+                    f"UWB region={region} {capture_mode} target captured: az={azimuth:.1f}deg "
+                    f"raw_az={raw_azimuth:.1f}deg "
+                    f"raw_el={elevation:.1f}deg body_el={body_elevation:.1f}deg "
+                    f"hdist={horizontal_dist:.2f}/"
+                    f"{self.uwb_center_capture_hdist_m if capture_mode == 'center' else self.uwb_capture_radius_m:.2f}m "
+                    f"body_dist=({forward_dist:.2f},{lateral_dist:.2f},{vertical_dist:.2f}) "
                     f"stable={capture_elapsed:.1f}s"
                 )
                 self._transition(Phase.HOVER_ABOVE)
                 return
             self._uwb_capture_start_time = None
+            self._uwb_capture_mode = None
 
         if (
             self._is_uwb_approach_land_mode()
@@ -2033,6 +2469,17 @@ class TestMissionNode(Node):
             )
             return
 
+        if self._is_uwb_approach_land_mode() and self._uwb_front_line_locked:
+            if horizontal_dist > stop_radius:
+                vx = clamp(
+                    self.kp_horizontal * max(forward_dist, 0.0),
+                    0.0,
+                    speed_limit,
+                )
+            else:
+                vx = 0.0
+            vy = 0.0
+
         self._publish_velocity(vx, vy, vz, frame_id="body")
 
         if abs(azimuth) < self.azimuth_deadband and horizontal_dist < self.horizontal_deadband:
@@ -2047,15 +2494,186 @@ class TestMissionNode(Node):
             self.hover_start_time = None
             alt_text = "missing" if rel_alt is None else f"{rel_alt:.2f}m"
             self.get_logger().info(
-                f"UWB approach BODY_NED: az={azimuth:.1f}deg raw_az={raw_azimuth:.1f}deg "
-                f"el={elevation:.1f}deg hdist={horizontal_dist:.2f}m "
-                f"body_dist=({forward_dist:.2f},{lateral_dist:.2f}) "
+                f"UWB approach BODY_NED: region={region} reason={region_reason} "
+                f"az={azimuth:.1f}deg raw_az={raw_azimuth:.1f}deg "
+                f"raw_el={elevation:.1f}deg body_el={body_elevation:.1f}deg "
+                f"hdist={horizontal_dist:.2f}m "
+                f"body_dist=({forward_dist:.2f},{lateral_dist:.2f},{vertical_dist:.2f}) "
                 f"rel_alt={alt_text} ({alt_source}) "
                 f"cmd_body=({vx:.2f},{vy:.2f},{vz:.2f}) speed_limit={speed_limit:.2f} "
+                f"front_line_locked={self._uwb_front_line_locked} "
                 f"front_limit={self.uwb_approach_front_sector_deg:.1f}deg "
+                f"line_lock={self.uwb_front_line_lock_deg:.1f}deg "
                 f"capture_limit={self.uwb_capture_front_sector_deg:.1f}deg",
                 throttle_duration_sec=1.0,
             )
+
+    def _tick_uwb_scan_yaw(self):
+        if not self._is_uwb_approach_land_mode():
+            self._transition(Phase.MOVE_ABOVE)
+            return
+
+        now = self.get_clock().now()
+        if self._uwb_scan_start_time is None:
+            self._uwb_scan_start_time = now
+            self._uwb_scan_lock_start_time = None
+            direction_text = "positive" if self._uwb_scan_direction > 0.0 else "negative"
+            self.get_logger().warn(
+                f"UWB yaw scan started: rate={self.uwb_scan_yaw_rate_deg_s:.1f}deg/s "
+                f"timeout={self.uwb_scan_timeout_sec:.1f}s "
+                f"lock_limit={self.uwb_scan_lock_front_sector_deg:.1f}deg "
+                f"direction={direction_text}"
+            )
+
+        rel_alt, alt_source = self._get_takeoff_land_relative_altitude()
+        vz = 0.0
+        if rel_alt is not None:
+            alt_err = self.takeoff_altitude - rel_alt
+            vz = clamp(self.kp_vertical * alt_err, -self.max_vel_z, self.max_vel_z)
+
+        yaw_rate = math.radians(self.uwb_scan_yaw_rate_deg_s) * self._uwb_scan_direction
+        elapsed = (now - self._uwb_scan_start_time).nanoseconds / 1e9
+
+        if elapsed < self.uwb_scan_settle_sec:
+            self._publish_velocity(0.0, 0.0, vz, frame_id="body", yaw_rate=0.0, immediate=True)
+            alt_text = "missing" if rel_alt is None else f"{rel_alt:.2f}m ({alt_source})"
+            self.get_logger().info(
+                f"UWB yaw scan settling: rel_alt={alt_text} "
+                f"elapsed={elapsed:.1f}/{self.uwb_scan_settle_sec:.1f}s "
+                f"cmd_body=(0.00,0.00,{vz:.2f}) yaw_rate=0.0deg/s",
+                throttle_duration_sec=0.5,
+            )
+            return
+
+        uwb = self._get_uwb()
+        if uwb is not None and self._uwb_valid_and_fresh():
+            raw_azimuth, distance, elevation = uwb
+            geom = self._uwb_smoothed_geometry(now, raw_azimuth, distance, elevation)
+            azimuth = geom["body_azimuth"]
+            body_elevation = geom["body_elevation"]
+            horizontal_dist = geom["horizontal_dist"]
+            region, region_reason = self._uwb_classify_region(geom)
+            region_elapsed = self._uwb_update_region_hold(now, region)
+
+            if region == "INVALID_HOLD":
+                self._uwb_scan_lock_start_time = None
+                self.get_logger().warn(
+                    f"UWB yaw scan region={region}: reason={region_reason} az={azimuth:.1f}deg "
+                    f"raw_az={raw_azimuth:.1f}deg raw_el={elevation:.1f}deg "
+                    f"body_el={body_elevation:.1f}/{self.uwb_min_body_elevation_deg:.1f}deg "
+                    f"hdist={horizontal_dist:.2f}m elapsed={elapsed:.1f}/"
+                    f"{self.uwb_scan_timeout_sec:.1f}s",
+                    throttle_duration_sec=0.5,
+                )
+            elif region == "CENTER_CAPTURE":
+                if self._uwb_scan_lock_start_time is None:
+                    self._uwb_scan_lock_start_time = now
+                    lock_elapsed = 0.0
+                else:
+                    lock_elapsed = (now - self._uwb_scan_lock_start_time).nanoseconds / 1e9
+                self._publish_velocity(0.0, 0.0, vz, frame_id="body", yaw_rate=0.0, immediate=True)
+                if lock_elapsed >= self.uwb_center_stable_sec:
+                    self._uwb_target_captured = True
+                    self._uwb_approach_ok = True
+                    self.get_logger().info(
+                        f"UWB yaw scan reached center: region={region} reason={region_reason} "
+                        f"az={azimuth:.1f}deg raw_az={raw_azimuth:.1f}deg raw_el={elevation:.1f}deg "
+                        f"body_el={body_elevation:.1f}deg hdist={horizontal_dist:.2f}m "
+                        f"stable={lock_elapsed:.1f}s; hovering above target"
+                    )
+                    self._publish_event("uwb_scan_center_captured")
+                    self._transition(Phase.HOVER_ABOVE)
+                    return
+                self.get_logger().info(
+                    f"UWB yaw scan center candidate: region={region} reason={region_reason} "
+                    f"az={azimuth:.1f}deg raw_az={raw_azimuth:.1f}deg raw_el={elevation:.1f}deg "
+                    f"body_el={body_elevation:.1f}deg hdist={horizontal_dist:.2f}m "
+                    f"stable={lock_elapsed:.1f}/{self.uwb_center_stable_sec:.1f}s",
+                    throttle_duration_sec=0.2,
+                )
+                return
+            elif region == "NEAR_CENTER_HOLD":
+                self.get_logger().info(
+                    f"UWB yaw scan near center: region={region} reason={region_reason} "
+                    f"az={azimuth:.1f}deg raw_az={raw_azimuth:.1f}deg raw_el={elevation:.1f}deg "
+                    f"body_el={body_elevation:.1f}deg hdist={horizontal_dist:.2f}m; resuming hold"
+                )
+                self._publish_velocity(0.0, 0.0, vz, frame_id="body", yaw_rate=0.0, immediate=True)
+                self._transition(Phase.MOVE_ABOVE)
+                return
+            elif region == "FRONT_APPROACH":
+                if abs(azimuth) > self.uwb_scan_lock_front_sector_deg:
+                    self._uwb_scan_lock_start_time = None
+                    self.get_logger().info(
+                        f"UWB yaw scan front candidate rejected: az={azimuth:.1f}/"
+                        f"{self.uwb_scan_lock_front_sector_deg:.1f}deg "
+                        f"raw_az={raw_azimuth:.1f}deg raw_el={elevation:.1f}deg "
+                        f"body_el={body_elevation:.1f}deg hdist={horizontal_dist:.2f}m",
+                        throttle_duration_sec=0.5,
+                    )
+                else:
+                    if self._uwb_scan_lock_start_time is None:
+                        self._uwb_scan_lock_start_time = now
+                        lock_elapsed = 0.0
+                    else:
+                        lock_elapsed = (now - self._uwb_scan_lock_start_time).nanoseconds / 1e9
+                    self._publish_velocity(0.0, 0.0, vz, frame_id="body", yaw_rate=0.0, immediate=True)
+                    if lock_elapsed >= self.uwb_scan_lock_stable_sec:
+                        self._uwb_front_stable_once = True
+                        self._uwb_front_line_locked = True
+                        self.get_logger().info(
+                            f"UWB yaw scan locked target: region={region} reason={region_reason} "
+                            f"az={azimuth:.1f}deg "
+                            f"raw_az={raw_azimuth:.1f}deg raw_el={elevation:.1f}deg "
+                            f"body_el={body_elevation:.1f}deg "
+                            f"hdist={horizontal_dist:.2f}m stable={lock_elapsed:.1f}s; "
+                            f"front_line_locked=true, resuming approach"
+                        )
+                        self._publish_event("uwb_scan_locked")
+                        self._transition(Phase.MOVE_ABOVE)
+                        return
+                    self.get_logger().info(
+                        f"UWB yaw scan lock candidate: region={region} reason={region_reason} "
+                        f"az={azimuth:.1f}deg "
+                        f"raw_az={raw_azimuth:.1f}deg raw_el={elevation:.1f}deg "
+                        f"body_el={body_elevation:.1f}deg hdist={horizontal_dist:.2f}m "
+                        f"stable={lock_elapsed:.1f}/{self.uwb_scan_lock_stable_sec:.1f}s",
+                        throttle_duration_sec=0.2,
+                    )
+                    return
+
+            self._uwb_scan_lock_start_time = None
+            self.get_logger().warn(
+                f"UWB yaw scanning: region={region} reason={region_reason} "
+                f"az={azimuth:.1f}deg raw_az={raw_azimuth:.1f}deg "
+                f"hdist={horizontal_dist:.2f}m elapsed={elapsed:.1f}/"
+                f"{self.uwb_scan_timeout_sec:.1f}s",
+                throttle_duration_sec=0.5,
+            )
+        else:
+            self._uwb_scan_lock_start_time = None
+            self.get_logger().warn(
+                f"UWB yaw scanning with no fresh UWB data elapsed={elapsed:.1f}/"
+                f"{self.uwb_scan_timeout_sec:.1f}s",
+                throttle_duration_sec=0.5,
+            )
+
+        if elapsed >= self.uwb_scan_timeout_sec:
+            reason = f"UWB yaw scan timeout after {elapsed:.1f}s"
+            self.get_logger().warn(f"{reason}; landing")
+            self._publish_velocity(0.0, 0.0, vz, frame_id="body", yaw_rate=0.0, immediate=True)
+            self._publish_event("uwb_scan_timeout_land")
+            self._takeoff_land_abort_reason = reason
+            self._transition(Phase.LAND)
+            return
+
+        alt_text = "missing" if rel_alt is None else f"{rel_alt:.2f}m ({alt_source})"
+        self._publish_velocity(0.0, 0.0, vz, frame_id="body", yaw_rate=yaw_rate, immediate=True)
+        self.get_logger().info(
+            f"UWB yaw scan command: rel_alt={alt_text} "
+            f"cmd_body=(0.00,0.00,{vz:.2f}) yaw_rate={math.degrees(yaw_rate):.1f}deg/s",
+            throttle_duration_sec=1.0,
+        )
 
     def _tick_hover_above(self):
         if self._is_uwb_approach_land_mode():
@@ -2510,8 +3128,20 @@ class TestMissionNode(Node):
             self._uwb_missing_start_time = None
             self._uwb_out_of_front_start_time = None
             self._uwb_capture_start_time = None
-            if new_phase not in (Phase.HOVER_ABOVE, Phase.LAND):
+            self._uwb_capture_mode = None
+            self._uwb_front_start_time = None
+            if new_phase not in (Phase.UWB_SCAN_YAW, Phase.HOVER_ABOVE, Phase.LAND):
+                self._uwb_front_stable_once = False
+                self._uwb_front_line_locked = False
+                self._uwb_region_samples = []
+                self._uwb_region_hold_start_time = None
+                self._uwb_last_region = None
                 self._uwb_target_captured = False
+        if new_phase != Phase.UWB_SCAN_YAW:
+            self._uwb_scan_start_time = None
+            self._uwb_scan_lock_start_time = None
+            if new_phase != Phase.MOVE_ABOVE:
+                self._uwb_region_hold_start_time = None
         if new_phase != Phase.FORWARD:
             self._forward_start_time = None
             self._forward_start_xy = None
@@ -2534,6 +3164,7 @@ class TestMissionNode(Node):
         vy: float,
         vz: float,
         frame_id: str = "body",
+        yaw_rate: float = 0.0,
         immediate: bool = False,
     ):
         now = self.get_clock().now()
@@ -2551,6 +3182,7 @@ class TestMissionNode(Node):
         msg.twist.linear.x = vx
         msg.twist.linear.y = vy
         msg.twist.linear.z = vz
+        msg.twist.angular.z = yaw_rate
         self.vel_pub.publish(msg)
 
         self._last_velocity = (vx, vy, vz)

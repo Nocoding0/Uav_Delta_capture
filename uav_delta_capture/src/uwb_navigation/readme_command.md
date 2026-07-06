@@ -223,6 +223,28 @@ Home hover stable, landing
 TAKEOFF_WAYPOINT_RETURN_LAND RESULT: PASS
 ```
 
+## 4.4 UWB 27 点交互检测/校准
+
+用途：只读取 UWB 和测距仪数据，不 ARM、不切模式、不发布速度。按提示采集 3 个高度层级，每层 8 个方向加中心点，共 27 点。角度约定是无人机正前方 `0deg`、右侧 `90deg`、后方 `180deg`、左侧 `270deg`。当前标定后 `uwb_lateral_sign=-1.0`，CSV 中的 `body_*` 字段表示已校准到 BODY_NED 的机体系结果。每个点按回车后采样 3 秒，并输出原始 AOA、当前任务几何转换后的机体系数据和测距仪高度。
+
+```bash
+docker exec -it ros2humble bash -lc "
+  source /opt/ros/humble/setup.bash
+  source /workspace/uav_delta_capture/install/setup.bash
+  ros2 launch uwb_navigation uwb_calibration_recorder.launch.py
+"
+```
+
+当前 tag 放地面时保持默认 `tag_height_m:=0.0`。后续 tag 放在平台上时，只改运行参数，不要把平台高度写进任务代码：
+
+```bash
+ros2 launch uwb_navigation uwb_calibration_recorder.launch.py tag_height_m:=0.35
+```
+
+输出会实时打印 `raw=(d, az, el)`、`body=(az, el, fwd, lat, h)` 和 `range=`。采完后会保存两个文件：`/tmp/uwb_calibration_<timestamp>_summary.csv` 和 `/tmp/uwb_calibration_<timestamp>_raw.csv`。后续分析以 raw CSV 为准，用 summary CSV 快速看均值、标准差和异常点；不要只根据单点均值直接改飞行参数。
+
+UWB 接近任务现在使用基于 27 点标定特征的相对区间判别：`FRONT_APPROACH` 只有在严格前方窗口内稳定后才锁定直线接近，锁定后 `cmd_body` 固定为前向 `vx`、横向 `vy=0`；`NEAR_CENTER_HOLD` 在已直线锁定且仍有前向余量时只允许低速补前，否则保持高度；`CENTER_CAPTURE` 要求高俯仰角、小水平分量和更小的前后分量，稳定后进入悬停降落；`SIDE_REAR_SCAN` 才原地偏航扫描，扫描方向进入后固定不再左右翻转，扫描锁定也要求角度进入严格前方窗口；`INVALID_HOLD` 先悬停等待，若当前任务配置为 `SCAN`，超时后也进入偏航扫描。正下方附近的 UWB 方位角可能发散，所以已经前向稳定接近后，主要用高机体系俯仰角和小水平分量判断近中心，不再强制要求 `body_azimuth` 接近 0。
+
 ## 5. 上桨 UWB 接近降落精简测试
 
 用途：在简单 GUIDED 起降通过后，先验证“起飞、UWB 接近 tag 正上方、悬停、原地降落”。这个模式不做抓取、复飞、返航、投放，是完整任务前的上桨精简版本。
@@ -243,7 +265,9 @@ docker exec -it ros2humble bash -lc "
 UWB approach-land preflight
 Takeoff OK
 Phase: HOVER_TAKEOFF -> MOVE_ABOVE
-UWB approach:
+UWB approach BODY_NED: region=FRONT_APPROACH ...
+UWB region=NEAR_CENTER_HOLD ...
+UWB region=CENTER_CAPTURE center target captured ...
 Above target
 Phase: HOVER_ABOVE -> LAND
 UWB_APPROACH_LAND RESULT: PASS
