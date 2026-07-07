@@ -107,10 +107,10 @@ test_mission_node:
     # Real mechanical-arm handshake.
     fake_grasp: false
     fake_grasp_delay_sec: 10.0
-    grasp_timeout_sec: 20.0
+    grasp_timeout_sec: 25.0
     fake_drop: false
     fake_drop_delay_sec: 2.0
-    drop_timeout_sec: 10.0
+    drop_timeout_sec: 25.0
     grasp_command_topic: grasp_command
     drop_command_topic: drop_command
     grasp_done_topic: grasp_done

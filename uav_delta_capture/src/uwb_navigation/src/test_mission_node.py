@@ -767,12 +767,34 @@ class TestMissionNode(Node):
             self._last_link_status = msg.data
 
     def _grasp_callback(self, msg: String):
+        phase_name = PHASE_NAMES[self.phase]
         if string_is_done(msg.data):
             self._grasp_done = True
+            action = "will transition to CLIMB" if self.phase == Phase.WAIT_GRASP else "stored for WAIT_GRASP"
+            self.get_logger().info(
+                f"Received grasp_done on {self.grasp_done_topic}: data={msg.data!r} "
+                f"phase={phase_name}; {action}"
+            )
+        else:
+            self.get_logger().warn(
+                f"Ignored grasp_done on {self.grasp_done_topic}: data={msg.data!r} "
+                f"phase={phase_name}; expected done"
+            )
 
     def _drop_callback(self, msg: String):
+        phase_name = PHASE_NAMES[self.phase]
         if string_is_done(msg.data):
             self._drop_done = True
+            action = "will transition to LAND" if self.phase == Phase.WAIT_DROP else "stored for WAIT_DROP"
+            self.get_logger().info(
+                f"Received drop_done on {self.drop_done_topic}: data={msg.data!r} "
+                f"phase={phase_name}; {action}"
+            )
+        else:
+            self.get_logger().warn(
+                f"Ignored drop_done on {self.drop_done_topic}: data={msg.data!r} "
+                f"phase={phase_name}; expected done"
+            )
 
     def _publish_grasp_command_once(self):
         if self._grasp_command_sent:
@@ -3211,6 +3233,7 @@ class TestMissionNode(Node):
         if self._grasp_done:
             self._publish_event("grasp_complete")
             self._mission_grasp_ok = True
+            self.get_logger().info("grasp_done accepted, transitioning to CLIMB")
             self._transition(Phase.CLIMB)
             return
 
@@ -3364,6 +3387,7 @@ class TestMissionNode(Node):
         if self._drop_done:
             self._publish_event("drop_complete")
             self._mission_drop_ok = True
+            self.get_logger().info("drop_done accepted, transitioning to LAND")
             self._transition(Phase.LAND)
             return
 
