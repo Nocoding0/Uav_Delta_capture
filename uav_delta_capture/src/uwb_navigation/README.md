@@ -39,6 +39,7 @@ source /workspace/uav_delta_capture/install/setup.bash
 | `takeoff_forward_land` | `test_mission_takeoff_forward_land.launch.py` | `test_mission_takeoff_forward_land.yaml` | FCU、测距、光流、本地位置 | 低高度 GUIDED 起飞、按起飞时机头方向移动约 1.0m、悬停、降落 |
 | `takeoff_waypoint_return_land` | `test_mission_takeoff_waypoint_return_land.launch.py` | `test_mission_takeoff_waypoint_return_land.yaml` | FCU、测距、光流、本地位置 | 低高度 GUIDED 起飞、按起飞时机头方向定义目标点、返回起点、降落 |
 | `uwb_approach_land` | `test_mission_uwb_approach_land.launch.py` | `test_mission_uwb_approach_land.yaml` | 完整硬件 | 低高度速度起飞、UWB 接近 tag 上方；目标不在前向扇区时原地偏航扫描，捕获后悬停降落 |
+| `uwb_approach_grasp_return_land` | `test_mission_uwb_grasp_return_land.launch.py` | `test_mission_uwb_grasp_return_land.yaml` | 完整硬件+机械臂 | 复用 staged UWB 接近，tag 上方下降等待抓取，复飞后用 local_position 返航，投放后降落 |
 | `real_full` | `test_mission_real_full.launch.py` | `test_mission_real.yaml` | 完整硬件 | 完整起飞、UWB 接近、下降、抓取占位、返航、投放占位、降落 |
 
 `test_mission_real.launch.py` 目前是兼容旧命名的 bench 入口，实际等价于 `test_mission_bench.launch.py`。
@@ -102,6 +103,8 @@ INIT
 | `cmd_vel` | `geometry_msgs/msg/TwistStamped` | 给 `flight_commander_node` 的速度指令 |
 | `test_mission/state` | `std_msgs/msg/String` | 当前任务状态 |
 | `test_mission/event` | `std_msgs/msg/String` | 关键任务事件 |
+| `grasp_command` | `std_msgs/msg/String` | 进入抓取阶段时发布 `start_grasp` |
+| `drop_command` | `std_msgs/msg/String` | 进入投放阶段时发布 `start_drop` |
 | `uav_bridge/flight_reset` | `std_msgs/msg/String` | 降落完成后重置桥接状态 |
 
 ### 服务
@@ -111,7 +114,7 @@ INIT
 | `flight_command` | `uav_delta_msgs/srv/FlightCommand` | ARM、DISARM、TAKEOFF、LAND 等飞控命令 |
 | `/mavros/set_mode` | `mavros_msgs/srv/SetMode` | ARM 前必要时切换飞控模式 |
 
-`grasp_done` 和 `drop_done` 接受这些完成值：`true`、`ok`、`done`、`complete`、`success`、`1`，大小写不敏感。当前配置默认 `fake_grasp: true`、`fake_drop: true`，可以先用计时器占位。
+`grasp_done` 和 `drop_done` 接受这些完成值：`true`、`ok`、`done`、`complete`、`success`、`1`，大小写不敏感。完整 UWB 抓取返航入口默认 `fake_grasp: false`、`fake_drop: false`，会主动发布 `grasp_command`/`drop_command` 并等待外部完成信号。
 
 ## Mock 全流程测试
 
@@ -454,7 +457,9 @@ GUIDED 定位前进测试使用 `test_mission_takeoff_forward_land.launch.py`。
 
 GUIDED 航点往返测试使用 `test_mission_takeoff_waypoint_return_land.launch.py`。它沿用同一套 MAVROS takeoff 逻辑，到达低高度后先把 MAVROS `setpoint_velocity` 的 `mav_frame` 切到 `BODY_NED`，让 `waypoint_dx/waypoint_dy` 按机体系前/右解释；去程用 local_position 水平位移判定到点。目标点悬停后先下降到 `descend_altitude`，低位悬停 `low_hover_time`，再复飞到 `takeoff_altitude` 并稳住；随后节点把 `mav_frame` 切到 `LOCAL_NED`，按 local 坐标闭环平移回起点附近，最后 `LAND`。该测试不主动调转机头，用于验证光流/测距融合得到的 local_position 是否能支撑“去目标点、降落接近、复飞、回起点”。
 
-UWB 接近降落精简测试使用 `test_mission_uwb_approach_land.launch.py`。它在 `GUIDED` 下用测距相对高度执行低速起飞，避免 MAVROS 本地高度偏置导致先升高再回落；随后用 UWB 的直线距离、水平角和俯仰角解算机体系相对区间，再决定动作。UWB base 前下俯安装可通过 `uwb_mount_pitch_down_deg` 做机体系补偿，当前 staged 标定使用 `uwb_lateral_sign=-1.0` 把 UWB 横向方向校准到 BODY_NED。任务会按 27 点标定观察到的特征把目标分为 `FRONT_APPROACH`、`NEAR_CENTER_HOLD`、`CENTER_CAPTURE`、`SIDE_REAR_SCAN` 和 `INVALID_HOLD`：只有目标在严格前方窗口内稳定后才锁定直线接近，锁定后水平命令固定为机体系 X 正方向、`vy=0`，不再追随后续 UWB 横向漂移；已经前向稳定接近后，若读数进入高俯仰角、小水平分量且前后分量也足够小的近中心区间，则慢速补前或保持高度并允许捕获降落，不再因为正下方方位角发散而自旋；侧后方、前方但未对准，或几何俯仰短时无效但配置为 `SCAN` 时，进入固定方向偏航扫描，扫描锁定也要求角度进入严格前方窗口。这个测试不做抓取、复飞、返航、投放，是 `real_full` 前的上桨过渡入口。
+UWB 接近降落精简测试使用 `test_mission_uwb_approach_land.launch.py`。它在 `GUIDED` 下用测距相对高度执行低速起飞，避免 MAVROS 本地高度偏置导致先升高再回落；随后用 UWB 的直线距离、水平角和俯仰角解算机体系相对区间，再决定动作。UWB base 前下俯安装可通过 `uwb_mount_pitch_down_deg` 做机体系补偿，当前 staged 标定使用 `uwb_lateral_sign=-1.0` 把 UWB 横向方向校准到 BODY_NED。任务会按 27 点标定观察到的特征把目标分为 `FRONT_APPROACH`、`NEAR_CENTER_HOLD`、`CENTER_CAPTURE`、`SIDE_REAR_SCAN` 和 `INVALID_HOLD`：只有目标在严格前方窗口内稳定后才锁定直线接近，远距离保持机体系 X 正方向接近且 `vy=0`；进入近中心高俯仰角、小水平距离窗口后，才允许一个极小上限的横向 P 修正，日志中以 `lat_trim=true/false` 标记。已经前向稳定接近后，若读数进入高俯仰角、小水平分量且前后/左右分量也足够小的近中心区间，则慢速补前到预降落前向门限、少量横向修正或保持高度并允许捕获，不再因为正下方方位角发散而自旋；`NEAR_CENTER_HOLD` 也会使用同一套极小横向 P 修正，稳定后可直接进入 `HOVER_ABOVE`，并且近中心保护区内禁止负向 `vx` 后退追 tag；捕获后进入预降落稳定阶段，参考 27 点低高度中心特征继续校验 UWB raw elevation、水平分量、前后分量和左右分量，中心确认稳定后精简入口切 `LAND`，完整抓取返航入口则进入下降抓取；侧后方、前方但未对准，或几何俯仰短时无效但配置为 `SCAN` 时，进入固定方向偏航扫描，扫描锁定也要求角度进入严格前方窗口。精简入口不做抓取、复飞、返航、投放，是完整任务前的上桨过渡入口。
+
+完整抓取返航入口 `test_mission_uwb_grasp_return_land.launch.py` 使用更清晰的高度层级：`takeoff_altitude=0.75m` 用于起飞、UWB 接近、复飞和返航，中心确认后下降到 `descend_altitude=0.55m` 悬停并等待抓取完成信号；当前高度容差为 `0.12m`，UWB 接近阶段超时为 `40s`。起飞后进入 UWB 接近阶段使用独立的 `takeoff_transition_tolerance=0.20m`，避免测距高度在 0.57-0.65m 附近抖动时反复清零起飞悬停稳定计时；下降、复飞、返航等后续高度判断仍使用较严格的 `altitude_tolerance`。完整流程的预降落中心确认使用更宽的 `0.35m/0.18m/0.25m` 水平、前后、横向门限，横向微调按 `-kp*lateral_dist` 把误差拉回中心；近中心进入 `HOVER_ABOVE` 使用同一套预降落门限，避免 tag 上方附近长时间卡在 `MOVE_ABOVE`。若预降确认超时，会继续悬停并小幅修正 `uwb_preland_timeout_hold_sec=4.0s`，仍无法稳定则进入 `FAILSAFE LAND`。
 
 如果失败：
 
@@ -701,8 +706,13 @@ docker restart ros2humble
 | `uwb_center_hold_hdist_m` / `uwb_center_capture_hdist_m` | 已经前向稳定接近后，近中心悬停和捕获使用的水平分量阈值 |
 | `uwb_front_line_lock_deg` | `uwb_approach_land` 前方直线锁定和扫描锁定使用的严格前方角度窗口 |
 | `uwb_center_creep_speed_mps` | 已直线锁定且近中心但仍在 tag 前方时允许的低速前向补偿速度 |
+| `uwb_center_raw_elevation_min_deg` / `uwb_center_raw_elevation_max_deg` | 预降落中心确认参考的低高度中心 raw elevation 窗口 |
+| `uwb_preland_hdist_m` / `uwb_preland_max_abs_forward_m` / `uwb_preland_max_abs_lateral_m` | 切 LAND 或进入抓取前要求稳定满足的中心水平、前后和左右分量阈值 |
+| `uwb_preland_lateral_enable_hdist_m` / `uwb_preland_lateral_min_body_elevation_deg` | 允许近中心横向微调的水平距离和机体系俯仰角门限 |
+| `uwb_preland_lateral_deadband_m` / `uwb_preland_lateral_kp` / `uwb_preland_max_lateral_speed_mps` | 近中心横向 P 修正的死区、比例系数和速度上限；机体系命令按 `-kp*lateral_dist` 修正 |
+| `uwb_preland_stable_sec` / `uwb_preland_timeout_sec` / `uwb_preland_timeout_hold_sec` | 预降落中心确认稳定时间、首次超时时间和超时后的悬停微调尝试时间；完整流程仍不稳定则进入 `FAILSAFE LAND` |
 | `uwb_scan_settle_sec` | 进入 UWB 偏航扫描后先发布零 yaw/零 XY 的稳定等待时间 |
-| `uwb_center_max_abs_forward_m` | 近中心判别允许的最大前后分量，用来避免把后方高俯仰角误判成正上方 |
+| `uwb_center_max_abs_forward_m` / `uwb_center_max_abs_lateral_m` | 近中心判别允许的最大前后/左右分量，用来避免把偏离中心的高俯仰角误判成正上方 |
 | `uwb_center_min_body_elevation_deg` / `uwb_center_capture_body_elevation_deg` | 近中心悬停和捕获要求的机体系俯仰角阈值 |
 | `bench_velocity_z` | bench 阶段 Z 轴速度指令幅值 |
 | `bench_climb_sec` / `bench_hold_sec` / `bench_descend_sec` / `bench_zero_sec` | bench 速度曲线各阶段时长 |
@@ -710,6 +720,7 @@ docker restart ros2humble
 | `auto_modes` | 允许自主任务继续运行的飞控模式列表 |
 | `fake_grasp` / `fake_drop` | 是否用计时器代替真实抓取/投放完成信号 |
 | `grasp_timeout_sec` / `drop_timeout_sec` | `fake_grasp=false` 或 `fake_drop=false` 时等待外部完成信号的超时时间，超时进入 `FAILSAFE` |
+| `grasp_command_topic` / `drop_command_topic` | 完整 UWB 抓取返航任务进入抓取/投放阶段时发布命令的话题 |
 
 ## 常见问题
 

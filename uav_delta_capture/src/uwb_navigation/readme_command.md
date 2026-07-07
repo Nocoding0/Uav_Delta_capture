@@ -243,7 +243,7 @@ ros2 launch uwb_navigation uwb_calibration_recorder.launch.py tag_height_m:=0.35
 
 输出会实时打印 `raw=(d, az, el)`、`body=(az, el, fwd, lat, h)` 和 `range=`。采完后会保存两个文件：`/tmp/uwb_calibration_<timestamp>_summary.csv` 和 `/tmp/uwb_calibration_<timestamp>_raw.csv`。后续分析以 raw CSV 为准，用 summary CSV 快速看均值、标准差和异常点；不要只根据单点均值直接改飞行参数。
 
-UWB 接近任务现在使用基于 27 点标定特征的相对区间判别：`FRONT_APPROACH` 只有在严格前方窗口内稳定后才锁定直线接近，锁定后 `cmd_body` 固定为前向 `vx`、横向 `vy=0`；`NEAR_CENTER_HOLD` 在已直线锁定且仍有前向余量时只允许低速补前，否则保持高度；`CENTER_CAPTURE` 要求高俯仰角、小水平分量和更小的前后分量，稳定后进入悬停降落；`SIDE_REAR_SCAN` 才原地偏航扫描，扫描方向进入后固定不再左右翻转，扫描锁定也要求角度进入严格前方窗口；`INVALID_HOLD` 先悬停等待，若当前任务配置为 `SCAN`，超时后也进入偏航扫描。正下方附近的 UWB 方位角可能发散，所以已经前向稳定接近后，主要用高机体系俯仰角和小水平分量判断近中心，不再强制要求 `body_azimuth` 接近 0。
+UWB 接近任务现在使用基于 27 点标定特征的相对区间判别：`FRONT_APPROACH` 只有在严格前方窗口内稳定后才锁定直线接近，远距离仍保持横向 `vy=0`，避免追随 UWB 横向噪声斜飞；进入近中心高俯仰角、小水平距离窗口后才允许很小的横向 P 修正，日志会显示 `lat_trim=true/false`。`NEAR_CENTER_HOLD` 在已直线锁定且仍有前向余量时低速补前到预降落前向门限，同时允许极小横向 P 微调；如果高俯仰角、小水平距离和预降落门限已经稳定，则直接进入 `HOVER_ABOVE`，避免到 tag 正上方附近后仍像远距离搜索一样反复找。近中心保护区内禁止负向 `vx` 后退追 tag，UWB 方位角跳到侧后方时也优先保持中心确认。`CENTER_CAPTURE` 要求高俯仰角、小水平分量、更小的前后分量和独立左右分量门限，并优先按 center capture 连续计时，稳定后进入预降落阶段；预降落阶段会参考 27 点低高度中心特征继续校验 UWB raw elevation、水平分量、前后分量和左右分量，中心确认稳定后才切 `LAND` 或完整任务的下降抓取阶段；`SIDE_REAR_SCAN` 才原地偏航扫描，扫描方向进入后固定不再左右翻转，扫描锁定也要求角度进入严格前方窗口；`INVALID_HOLD` 先悬停等待，若当前任务配置为 `SCAN`，超时后也进入偏航扫描。正下方附近的 UWB 方位角可能发散，所以已经前向稳定接近后，主要用高机体系俯仰角和小水平分量判断近中心，不再强制要求 `body_azimuth` 接近 0。完整抓取返航入口额外使用 `takeoff_transition_tolerance=0.20m` 作为起飞后进入 UWB 接近阶段的独立门槛，日志里的 `threshold=...m` 是实际过渡门槛；这不会放宽后续下降、复飞、返航的高度容差。完整流程预降落阶段的横向微调按 `-kp*lateral_dist` 修正；预降确认超时后会继续悬停并小幅修正 `uwb_preland_timeout_hold_sec=4.0s`，仍无法稳定则进入 `FAILSAFE LAND`。
 
 ## 5. 上桨 UWB 接近降落精简测试
 
@@ -267,6 +267,7 @@ Takeoff OK
 Phase: HOVER_TAKEOFF -> MOVE_ABOVE
 UWB approach BODY_NED: region=FRONT_APPROACH ...
 UWB region=NEAR_CENTER_HOLD ...
+UWB region=NEAR_CENTER_HOLD: near center held, hovering above target ...
 UWB region=CENTER_CAPTURE center target captured ...
 Above target
 Phase: HOVER_ABOVE -> LAND
@@ -274,6 +275,52 @@ UWB_APPROACH_LAND RESULT: PASS
 ```
 
 通过后再考虑恢复 `test_mission_real_full.launch.py` 的完整抓取、返航、投放流程。
+
+### 5.1 上桨 UWB 抓取返航完整流程测试
+
+用途：完全连接真实 FCU、UWB、光流/测距和机械臂模块，发送真实起飞命令。前半段复用当前 UWB staged 接近逻辑，飞到 tag 正上方并完成中心确认后不原地降落，而是从 `takeoff_altitude=0.75m` 降到 `descend_altitude=0.55m` 悬停，发布抓取命令，等待机械臂完成信号；随后复飞到 `0.75m`、切到 `LOCAL_NED`，用 `/mavros/local_position/pose` 闭环返回起飞点上方，发布投放命令，等待完成信号后自动 `LAND`。当前完整流程的起飞高度容差为 `0.12m`，UWB 接近超时为 `40s`，用于给近中心小幅微调和稳定确认留出时间。
+
+机械臂接口：
+
+```text
+/grasp_command std_msgs/msg/String: start_grasp
+/grasp_done    std_msgs/msg/String: done
+/drop_command  std_msgs/msg/String: start_drop
+/drop_done     std_msgs/msg/String: done
+```
+
+备用手动完成信号：
+
+```bash
+docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && ros2 topic pub --once /grasp_done std_msgs/msg/String '{data: done}'"
+docker exec ros2humble bash -lc "source /opt/ros/humble/setup.bash && ros2 topic pub --once /drop_done std_msgs/msg/String '{data: done}'"
+```
+
+```bash
+docker exec -it ros2humble bash -lc "
+  source /opt/ros/humble/setup.bash
+  source /workspace/uav_delta_capture/install/setup.bash
+  ros2 launch uwb_navigation test_mission_uwb_grasp_return_land.launch.py
+"
+```
+
+关键日志：
+
+```text
+UWB grasp-return-land preflight
+UWB region=CENTER_CAPTURE center target captured ...
+UWB preland center confirmed, descending for grasp ...
+Phase: HOVER_ABOVE -> DESCEND
+Phase: HOVER_FINAL -> WAIT_GRASP
+Publishing grasp command
+grasp_complete
+Phase: HOVER_CLIMB -> WAYPOINT_RETURN
+MAVROS setpoint_velocity mav_frame confirmed: LOCAL_NED
+Waypoint return reached
+Publishing drop command
+drop_complete
+UWB_GRASP_RETURN_LAND RESULT: PASS
+```
 
 ## 6. 日志查看
 
@@ -289,6 +336,9 @@ docker exec ros2humble bash -lc "grep -E 'Takeoff-land preflight|TAKEOFF_LAND RE
 
 # UWB 接近降落精简任务后台日志
 docker exec ros2humble bash -lc "grep -E 'UWB approach-land preflight|UWB_APPROACH_LAND RESULT|Core links|Sensor links|Phase|Takeoff OK|UWB approach|Above target|Landing complete|LAND_WAIT|FAILSAFE|ERROR|WARN' /tmp/mission_uwb_approach_land.log | tail -180"
+
+# UWB 抓取返航完整任务后台日志
+docker exec ros2humble bash -lc "grep -E 'UWB grasp-return-land preflight|UWB_GRASP_RETURN_LAND RESULT|Core links|Sensor links|Phase|Takeoff OK|UWB approach|UWB preland|Publishing grasp|grasp_complete|Waypoint return|Publishing drop|drop_complete|Landing complete|LAND_WAIT|FAILSAFE|ERROR|WARN' /tmp/mission_uwb_grasp_return_land.log | tail -220"
 
 # GUIDED 定位前进降落后台日志
 docker exec ros2humble bash -lc "grep -E 'Takeoff-forward-land preflight|TAKEOFF_FORWARD_LAND RESULT|Core links|Sensor links|Phase|Takeoff OK|Forward moving|Forward target|Landing complete|LAND_WAIT|FAILSAFE|ERROR|WARN' /tmp/mission_takeoff_forward_land.log | tail -180"

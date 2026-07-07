@@ -13,24 +13,27 @@ test_mission_node:
     mission_event_topic: test_mission/event
     flight_command_service: flight_command
 
-    # Mode: low-altitude prop-on test before real_full.
-    mission_mode: uwb_approach_land
+    # Mode: real UWB approach, low hover for grasp, return home, drop, and LAND.
+    mission_mode: uwb_approach_grasp_return_land
     use_mock: false
     desktop_test: false
     arm_mode: ALT_HOLD
 
-    # UWB staged test: MAVROS takeoff plus a conservative UWB approach.
-    takeoff_altitude: 0.6
+    # MAVROS takeoff plus conservative UWB approach.
+    takeoff_altitude: 0.75
     takeoff_method: mavros
     takeoff_climb_velocity: 0.12
     takeoff_command_delay_sec: 1.5
-    takeoff_height_timeout_sec: 15.0
-    descend_altitude: 0.5
+    takeoff_height_timeout_sec: 25.0
+    descend_altitude: 0.55
     hover_stable_time: 2.0
+    target_hover_time: 2.0
+    return_hover_time: 2.0
     max_vel_xy: 0.15
     max_vel_z: 0.15
     velocity_slew_rate: 0.2
-    altitude_tolerance: 0.15
+    altitude_tolerance: 0.12
+    takeoff_transition_tolerance: 0.20
     control_rate_hz: 20.0
     land_ground_rel_alt_threshold: 0.12
     land_ground_stable_sec: 1.5
@@ -41,11 +44,6 @@ test_mission_node:
     kp_vertical: 0.25
     azimuth_deadband: 5.0
     horizontal_deadband: 0.25
-    # BODY_NED UWB approach mapping:
-    # azimuth_offset subtracts fixed UWB mounting yaw; mount_pitch_down rotates the UWB base
-    # vector into the UAV body frame when the base points forward-down.
-    # signs calibrate the UWB base vector into UAV BODY_NED before azimuth,
-    # capture, scan-lock, and velocity calculations.
     uwb_azimuth_offset_deg: 0.0
     uwb_mount_pitch_down_deg: -45.0
     uwb_forward_sign: 1.0
@@ -64,9 +62,9 @@ test_mission_node:
     uwb_center_max_abs_lateral_m: 0.15
     uwb_center_raw_elevation_min_deg: 30.0
     uwb_center_raw_elevation_max_deg: 55.0
-    uwb_preland_hdist_m: 0.25
-    uwb_preland_max_abs_forward_m: 0.12
-    uwb_preland_max_abs_lateral_m: 0.12
+    uwb_preland_hdist_m: 0.35
+    uwb_preland_max_abs_forward_m: 0.18
+    uwb_preland_max_abs_lateral_m: 0.25
     uwb_preland_lateral_enable_hdist_m: 0.45
     uwb_preland_lateral_min_body_elevation_deg: 60.0
     uwb_preland_lateral_deadband_m: 0.05
@@ -74,6 +72,8 @@ test_mission_node:
     uwb_preland_max_lateral_speed_mps: 0.015
     uwb_preland_stable_sec: 1.5
     uwb_preland_timeout_sec: 6.0
+    uwb_preland_timeout_hold_sec: 4.0
+    uwb_preland_retry_limit: 0
     uwb_center_stable_sec: 0.8
     uwb_center_creep_speed_mps: 0.02
     uwb_slow_radius_m: 1.0
@@ -93,8 +93,28 @@ test_mission_node:
     uwb_scan_settle_sec: 0.5
     mission_soft_radius_m: 2.0
     mission_hard_radius_m: 2.5
-    move_above_timeout_sec: 20.0
+    move_above_timeout_sec: 40.0
     uwb_missing_timeout_sec: 3.0
+
+    # Return uses LOCAL_NED local_position after UWB approach and grasp.
+    kp_waypoint: 0.45
+    waypoint_max_velocity: 0.30
+    waypoint_xy_tolerance: 0.20
+    waypoint_timeout_sec: 12.0
+    kp_return: 0.5
+    return_xy_tolerance: 0.3
+
+    # Real mechanical-arm handshake.
+    fake_grasp: false
+    fake_grasp_delay_sec: 10.0
+    grasp_timeout_sec: 20.0
+    fake_drop: false
+    fake_drop_delay_sec: 2.0
+    drop_timeout_sec: 10.0
+    grasp_command_topic: grasp_command
+    drop_command_topic: drop_command
+    grasp_done_topic: grasp_done
+    drop_done_topic: drop_done
 
     # This test requires all flight observation links plus UWB.
     require_uwb_ready: true
@@ -109,18 +129,12 @@ test_mission_node:
     auto_modes: GUIDED
 
     # Unused by this mode, kept for shared node parameters.
-    fake_grasp: true
-    fake_grasp_delay_sec: 10.0
-    grasp_timeout_sec: 15.0
-    fake_drop: true
-    fake_drop_delay_sec: 2.0
-    drop_timeout_sec: 10.0
-    grasp_command_topic: grasp_command
-    drop_command_topic: drop_command
-    grasp_done_topic: grasp_done
-    drop_done_topic: drop_done
-    kp_return: 0.5
-    return_xy_tolerance: 0.3
+    low_hover_time: 4.0
+    waypoint_dx: 1.0
+    waypoint_dy: 0.0
+    forward_target_distance: 1.0
+    forward_velocity: 0.4
+    forward_timeout_sec: 12.0
     bench_velocity_z: 0.15
     bench_climb_sec: 2.0
     bench_hold_sec: 2.0

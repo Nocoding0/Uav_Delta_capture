@@ -134,6 +134,12 @@ class TestMissionNode(Node):
         self.drop_timeout_sec = self.declare_parameter("drop_timeout_sec", 10.0).value
         self.grasp_done_topic = self.declare_parameter("grasp_done_topic", "grasp_done").value
         self.drop_done_topic = self.declare_parameter("drop_done_topic", "drop_done").value
+        self.grasp_command_topic = self.declare_parameter(
+            "grasp_command_topic", "grasp_command"
+        ).value
+        self.drop_command_topic = self.declare_parameter(
+            "drop_command_topic", "drop_command"
+        ).value
 
         self.takeoff_altitude = self.declare_parameter("takeoff_altitude", 1.5).value
         self.descend_altitude = self.declare_parameter("descend_altitude", 0.5).value
@@ -219,6 +225,51 @@ class TestMissionNode(Node):
         self.uwb_center_max_abs_forward_m = self.declare_parameter(
             "uwb_center_max_abs_forward_m", 0.35
         ).value
+        self.uwb_center_max_abs_lateral_m = self.declare_parameter(
+            "uwb_center_max_abs_lateral_m", 0.15
+        ).value
+        self.uwb_center_raw_elevation_min_deg = self.declare_parameter(
+            "uwb_center_raw_elevation_min_deg", 30.0
+        ).value
+        self.uwb_center_raw_elevation_max_deg = self.declare_parameter(
+            "uwb_center_raw_elevation_max_deg", 55.0
+        ).value
+        self.uwb_preland_hdist_m = self.declare_parameter(
+            "uwb_preland_hdist_m", 0.25
+        ).value
+        self.uwb_preland_max_abs_forward_m = self.declare_parameter(
+            "uwb_preland_max_abs_forward_m", 0.12
+        ).value
+        self.uwb_preland_max_abs_lateral_m = self.declare_parameter(
+            "uwb_preland_max_abs_lateral_m", 0.12
+        ).value
+        self.uwb_preland_lateral_enable_hdist_m = self.declare_parameter(
+            "uwb_preland_lateral_enable_hdist_m", 0.45
+        ).value
+        self.uwb_preland_lateral_min_body_elevation_deg = self.declare_parameter(
+            "uwb_preland_lateral_min_body_elevation_deg", 60.0
+        ).value
+        self.uwb_preland_lateral_deadband_m = self.declare_parameter(
+            "uwb_preland_lateral_deadband_m", 0.05
+        ).value
+        self.uwb_preland_lateral_kp = self.declare_parameter(
+            "uwb_preland_lateral_kp", 0.12
+        ).value
+        self.uwb_preland_max_lateral_speed_mps = self.declare_parameter(
+            "uwb_preland_max_lateral_speed_mps", 0.015
+        ).value
+        self.uwb_preland_stable_sec = self.declare_parameter(
+            "uwb_preland_stable_sec", 1.5
+        ).value
+        self.uwb_preland_timeout_sec = self.declare_parameter(
+            "uwb_preland_timeout_sec", 6.0
+        ).value
+        self.uwb_preland_timeout_hold_sec = self.declare_parameter(
+            "uwb_preland_timeout_hold_sec", 4.0
+        ).value
+        self.uwb_preland_retry_limit = self.declare_parameter(
+            "uwb_preland_retry_limit", 0
+        ).value
         self.uwb_center_stable_sec = self.declare_parameter(
             "uwb_center_stable_sec", 0.8
         ).value
@@ -261,6 +312,9 @@ class TestMissionNode(Node):
         self.mission_soft_radius_m = self.declare_parameter("mission_soft_radius_m", 2.0).value
         self.mission_hard_radius_m = self.declare_parameter("mission_hard_radius_m", 2.5).value
         self.altitude_tolerance = self.declare_parameter("altitude_tolerance", 0.15).value
+        self.takeoff_transition_tolerance = self.declare_parameter(
+            "takeoff_transition_tolerance", self.altitude_tolerance
+        ).value
         self.return_xy_tolerance = self.declare_parameter("return_xy_tolerance", 0.3).value
 
         self.hover_stable_time = self.declare_parameter("hover_stable_time", 2.0).value
@@ -344,6 +398,11 @@ class TestMissionNode(Node):
         self.kp_return = max(0.01, self.kp_return)
         self.max_vel_xy = max(0.1, self.max_vel_xy)
         self.max_vel_z = max(0.05, self.max_vel_z)
+        self.takeoff_transition_tolerance = clamp(
+            abs(float(self.takeoff_transition_tolerance)),
+            0.0,
+            max(0.0, self.takeoff_altitude - self.loiter_min_rel_alt),
+        )
         self.velocity_slew_rate = max(0.01, self.velocity_slew_rate)
         self.bench_velocity_z = clamp(abs(self.bench_velocity_z), 0.02, self.max_vel_z)
         self.grasp_timeout_sec = max(0.1, float(self.grasp_timeout_sec))
@@ -406,6 +465,58 @@ class TestMissionNode(Node):
             0.05,
             float(self.uwb_center_max_abs_forward_m),
         )
+        self.uwb_center_max_abs_lateral_m = max(
+            0.05,
+            float(self.uwb_center_max_abs_lateral_m),
+        )
+        raw_el_min = float(self.uwb_center_raw_elevation_min_deg)
+        raw_el_max = float(self.uwb_center_raw_elevation_max_deg)
+        self.uwb_center_raw_elevation_min_deg = clamp(min(raw_el_min, raw_el_max), -89.0, 89.0)
+        self.uwb_center_raw_elevation_max_deg = clamp(max(raw_el_min, raw_el_max), -89.0, 89.0)
+        self.uwb_preland_hdist_m = clamp(
+            float(self.uwb_preland_hdist_m),
+            0.05,
+            self.uwb_center_hold_hdist_m,
+        )
+        self.uwb_preland_max_abs_forward_m = max(
+            0.02,
+            float(self.uwb_preland_max_abs_forward_m),
+        )
+        self.uwb_preland_max_abs_lateral_m = max(
+            0.02,
+            float(self.uwb_preland_max_abs_lateral_m),
+        )
+        self.uwb_preland_lateral_enable_hdist_m = clamp(
+            float(self.uwb_preland_lateral_enable_hdist_m),
+            self.uwb_preland_hdist_m,
+            self.uwb_center_hold_hdist_m,
+        )
+        self.uwb_preland_lateral_min_body_elevation_deg = clamp(
+            float(self.uwb_preland_lateral_min_body_elevation_deg),
+            self.uwb_min_body_elevation_deg,
+            89.0,
+        )
+        self.uwb_preland_lateral_deadband_m = clamp(
+            abs(float(self.uwb_preland_lateral_deadband_m)),
+            0.0,
+            self.uwb_preland_max_abs_lateral_m,
+        )
+        self.uwb_preland_lateral_kp = max(0.0, float(self.uwb_preland_lateral_kp))
+        self.uwb_preland_max_lateral_speed_mps = clamp(
+            abs(float(self.uwb_preland_max_lateral_speed_mps)),
+            0.0,
+            self.max_vel_xy,
+        )
+        self.uwb_preland_stable_sec = max(0.0, float(self.uwb_preland_stable_sec))
+        self.uwb_preland_timeout_sec = max(
+            self.uwb_preland_stable_sec,
+            float(self.uwb_preland_timeout_sec),
+        )
+        self.uwb_preland_timeout_hold_sec = max(
+            0.0,
+            float(self.uwb_preland_timeout_hold_sec),
+        )
+        self.uwb_preland_retry_limit = max(0, int(self.uwb_preland_retry_limit))
         self.uwb_center_stable_sec = max(0.0, float(self.uwb_center_stable_sec))
         self.uwb_front_sector_timeout_sec = max(0.2, float(self.uwb_front_sector_timeout_sec))
         self.uwb_capture_stable_sec = max(0.0, float(self.uwb_capture_stable_sec))
@@ -509,6 +620,10 @@ class TestMissionNode(Node):
         self._last_optical_flow_time = self.get_clock().now()
         self._grasp_done = False
         self._drop_done = False
+        self._grasp_command_sent = False
+        self._drop_command_sent = False
+        self._mission_grasp_ok = False
+        self._mission_drop_ok = False
         self._bench_arm_ok = False
         self._bench_velocity_started = False
         self._bench_velocity_done = False
@@ -533,6 +648,9 @@ class TestMissionNode(Node):
         self._uwb_out_of_front_start_time = None
         self._uwb_capture_start_time = None
         self._uwb_capture_mode = None
+        self._uwb_preland_stable_start_time = None
+        self._uwb_preland_timeout_hold_start_time = None
+        self._uwb_preland_retry_count = 0
         self._uwb_front_start_time = None
         self._uwb_front_stable_once = False
         self._uwb_front_line_locked = False
@@ -553,6 +671,7 @@ class TestMissionNode(Node):
         self._land_disarm_sent = False
         self._land_disarm_retry_count = 0
         self._land_disarm_retry_time = None
+        self._manual_pause_reason = None
         self._shutdown_requested = False
 
         cb_group = ReentrantCallbackGroup()
@@ -578,6 +697,8 @@ class TestMissionNode(Node):
         self.vel_pub = self.create_publisher(TwistStamped, self.cmd_vel_topic, 20)
         self.state_pub = self.create_publisher(String, self.mission_state_topic, 10)
         self.event_pub = self.create_publisher(String, self.mission_event_topic, 10)
+        self.grasp_command_pub = self.create_publisher(String, self.grasp_command_topic, 10)
+        self.drop_command_pub = self.create_publisher(String, self.drop_command_topic, 10)
         self.flight_reset_pub = self.create_publisher(String, "uav_bridge/flight_reset", 10)
 
         self.flight_cmd_client = self.create_client(
@@ -652,6 +773,26 @@ class TestMissionNode(Node):
     def _drop_callback(self, msg: String):
         if string_is_done(msg.data):
             self._drop_done = True
+
+    def _publish_grasp_command_once(self):
+        if self._grasp_command_sent:
+            return
+        msg = String()
+        msg.data = "start_grasp"
+        self.grasp_command_pub.publish(msg)
+        self._publish_event("grasp_command:start_grasp")
+        self._grasp_command_sent = True
+        self.get_logger().info(f"Publishing grasp command on {self.grasp_command_topic}: start_grasp")
+
+    def _publish_drop_command_once(self):
+        if self._drop_command_sent:
+            return
+        msg = String()
+        msg.data = "start_drop"
+        self.drop_command_pub.publish(msg)
+        self._publish_event("drop_command:start_drop")
+        self._drop_command_sent = True
+        self.get_logger().info(f"Publishing drop command on {self.drop_command_topic}: start_drop")
 
     def _control_loop(self):
         if self._check_critical():
@@ -738,12 +879,13 @@ class TestMissionNode(Node):
                 self.previous_flight_phase = self.phase
                 self._publish_velocity(0.0, 0.0, 0.0, immediate=True)
                 self._publish_event(f"manual_takeover:{mode}")
+                self._manual_pause_reason = f"RC/mode takeover: {mode}"
                 self._transition(Phase.PAUSED_MANUAL)
                 return True
 
         radius = self._mission_xy_distance_from_origin()
         if (
-            self._is_uwb_approach_land_mode()
+            self._is_uwb_staged_mode()
             and radius is not None
             and radius >= self.mission_hard_radius_m
             and self.phase not in (Phase.LAND_WAIT, Phase.PAUSED_MANUAL)
@@ -936,6 +1078,7 @@ class TestMissionNode(Node):
                 body_elevation >= self.uwb_center_capture_body_elevation_deg
                 and horizontal_dist <= self.uwb_center_capture_hdist_m
                 and abs(forward_dist) <= self.uwb_center_max_abs_forward_m
+                and abs(lateral_dist) <= self.uwb_center_max_abs_lateral_m
             ):
                 return "CENTER_CAPTURE", "center_high_elevation_close"
             if (
@@ -1185,6 +1328,7 @@ class TestMissionNode(Node):
             "takeoff_forward_land",
             "takeoff_waypoint_return_land",
             "uwb_approach_land",
+            "uwb_approach_grasp_return_land",
         )
 
     def _is_takeoff_loiter_land_mode(self) -> bool:
@@ -1199,6 +1343,12 @@ class TestMissionNode(Node):
     def _is_uwb_approach_land_mode(self) -> bool:
         return self.mission_mode == "uwb_approach_land"
 
+    def _is_uwb_grasp_return_land_mode(self) -> bool:
+        return self.mission_mode == "uwb_approach_grasp_return_land"
+
+    def _is_uwb_staged_mode(self) -> bool:
+        return self._is_uwb_approach_land_mode() or self._is_uwb_grasp_return_land_mode()
+
     def _takeoff_land_label(self) -> str:
         if self._is_takeoff_loiter_land_mode():
             return "TAKEOFF_LOITER_LAND"
@@ -1208,6 +1358,8 @@ class TestMissionNode(Node):
             return "TAKEOFF_WAYPOINT_RETURN_LAND"
         if self._is_uwb_approach_land_mode():
             return "UWB_APPROACH_LAND"
+        if self._is_uwb_grasp_return_land_mode():
+            return "UWB_GRASP_RETURN_LAND"
         return "TAKEOFF_LAND"
 
     def _takeoff_land_text(self) -> str:
@@ -1219,6 +1371,8 @@ class TestMissionNode(Node):
             return "Takeoff-waypoint-return-land"
         if self._is_uwb_approach_land_mode():
             return "UWB approach-land"
+        if self._is_uwb_grasp_return_land_mode():
+            return "UWB grasp-return-land"
         return "Takeoff-land"
 
     def _report_takeoff_land_result(self, force_fail_reason=None):
@@ -1245,10 +1399,18 @@ class TestMissionNode(Node):
             core_ok = core_ok and self._takeoff_land_forward_ok and self._takeoff_land_guided_return_ok
         if self._is_uwb_approach_land_mode():
             core_ok = core_ok and self._uwb_approach_ok
+        if self._is_uwb_grasp_return_land_mode():
+            core_ok = (
+                core_ok
+                and self._uwb_approach_ok
+                and self._mission_grasp_ok
+                and self._takeoff_land_guided_return_ok
+                and self._mission_drop_ok
+            )
         sensor_ok = (
             snapshot["fcu_ok"]
             and snapshot["rc_ok"]
-            and ((not self._is_uwb_approach_land_mode()) or snapshot["uwb_ok"])
+            and ((not self._is_uwb_staged_mode()) or snapshot["uwb_ok"])
             and snapshot["pose_ok"]
             and snapshot["range_ok"]
             and snapshot["flow_ok"]
@@ -1282,6 +1444,18 @@ class TestMissionNode(Node):
                 f"TAKEOFF={'OK' if self._takeoff_land_takeoff_ok else 'FAIL'} "
                 f"HOVER={'OK' if self._takeoff_land_hover_ok else 'FAIL'} "
                 f"UWB_APPROACH={'OK' if self._uwb_approach_ok else 'FAIL'} "
+                f"LAND={'OK' if self._takeoff_land_land_ok else 'FAIL'}"
+            )
+        elif self._is_uwb_grasp_return_land_mode():
+            core_text = (
+                "Core links: "
+                f"ARM={'OK' if self._bench_arm_ok else 'FAIL'} "
+                f"TAKEOFF={'OK' if self._takeoff_land_takeoff_ok else 'FAIL'} "
+                f"HOVER={'OK' if self._takeoff_land_hover_ok else 'FAIL'} "
+                f"UWB_APPROACH={'OK' if self._uwb_approach_ok else 'FAIL'} "
+                f"GRASP={'OK' if self._mission_grasp_ok else 'FAIL'} "
+                f"RETURN={'OK' if self._takeoff_land_guided_return_ok else 'FAIL'} "
+                f"DROP={'OK' if self._mission_drop_ok else 'FAIL'} "
                 f"LAND={'OK' if self._takeoff_land_land_ok else 'FAIL'}"
             )
         elif self._is_takeoff_forward_land_mode():
@@ -1339,7 +1513,7 @@ class TestMissionNode(Node):
             required_ok = (
                 snapshot["fcu_ok"]
                 and snapshot["rc_ok"]
-                and ((not self._is_uwb_approach_land_mode()) or snapshot["uwb_ok"])
+                and ((not self._is_uwb_staged_mode()) or snapshot["uwb_ok"])
                 and snapshot["pose_ok"]
                 and snapshot["range_ok"]
                 and snapshot["flow_ok"]
@@ -1356,7 +1530,7 @@ class TestMissionNode(Node):
                     self._publish_preflight_event(wait_event)
                 if not snapshot["rc_ok"]:
                     self.get_logger().warn("Waiting for RC/manual_input...", throttle_duration_sec=5.0)
-                if self._is_uwb_approach_land_mode() and not snapshot["uwb_ok"]:
+                if self._is_uwb_staged_mode() and not snapshot["uwb_ok"]:
                     self.get_logger().warn("Waiting for UWB...", throttle_duration_sec=5.0)
                 if not snapshot["pose_ok"]:
                     self.get_logger().warn("Waiting for local pose...", throttle_duration_sec=5.0)
@@ -1579,7 +1753,8 @@ class TestMissionNode(Node):
                 )
                 return
 
-            target_reached = rel_alt >= max(0.0, self.takeoff_altitude - self.altitude_tolerance)
+            takeoff_ready_alt = max(0.0, self.takeoff_altitude - self.takeoff_transition_tolerance)
+            target_reached = rel_alt >= takeoff_ready_alt
             if target_reached:
                 self._publish_velocity(0.0, 0.0, 0.0)
                 self._takeoff_land_takeoff_ok = True
@@ -1608,7 +1783,7 @@ class TestMissionNode(Node):
                     self.hover_start_time = None
                     self._start_mode_switch("LOITER", Phase.HOVER_LOITER, warn_only=False)
                     return
-                if self._is_uwb_approach_land_mode():
+                if self._is_uwb_staged_mode():
                     self._check_stable_and_transition(
                         Phase.MOVE_ABOVE,
                         f"Takeoff hover stable at rel_alt={rel_alt:.2f}m ({source}), starting UWB approach",
@@ -1671,7 +1846,7 @@ class TestMissionNode(Node):
 
             self.get_logger().info(
                 f"Waiting for MAVROS takeoff height: rel_alt={rel_alt:.2f}/"
-                f"{self.takeoff_altitude:.2f}m ({source})",
+                f"{self.takeoff_altitude:.2f}m threshold={takeoff_ready_alt:.2f}m ({source})",
                 throttle_duration_sec=1.0,
             )
             return
@@ -1981,7 +2156,12 @@ class TestMissionNode(Node):
         if self.use_mock:
             self.get_logger().info("Mock WAYPOINT_RETURN complete")
             self._takeoff_land_guided_return_ok = True
-            self._transition(Phase.HOVER_RETURN_HOME)
+            next_phase = (
+                Phase.HOVER_RETURN
+                if self._is_uwb_grasp_return_land_mode()
+                else Phase.HOVER_RETURN_HOME
+            )
+            self._transition(next_phase)
             return
 
         reached = self._tick_local_waypoint(
@@ -1993,7 +2173,12 @@ class TestMissionNode(Node):
         if reached:
             self._takeoff_land_guided_return_ok = True
             self._publish_event("waypoint_returned_home")
-            self._transition(Phase.HOVER_RETURN_HOME)
+            next_phase = (
+                Phase.HOVER_RETURN
+                if self._is_uwb_grasp_return_land_mode()
+                else Phase.HOVER_RETURN_HOME
+            )
+            self._transition(next_phase)
 
     def _tick_hover_return_home(self):
         self._publish_velocity(0.0, 0.0, 0.0)
@@ -2149,11 +2334,11 @@ class TestMissionNode(Node):
             return
 
         now = self.get_clock().now()
-        if self._is_uwb_approach_land_mode() and self._move_above_start_time is None:
+        if self._is_uwb_staged_mode() and self._move_above_start_time is None:
             self._move_above_start_time = now
             self._uwb_missing_start_time = None
 
-        if self._is_uwb_approach_land_mode() and self._move_above_start_time is not None:
+        if self._is_uwb_staged_mode() and self._move_above_start_time is not None:
             move_elapsed = (now - self._move_above_start_time).nanoseconds / 1e9
             if move_elapsed >= self.move_above_timeout_sec:
                 self._publish_velocity(0.0, 0.0, 0.0)
@@ -2166,7 +2351,7 @@ class TestMissionNode(Node):
         uwb = self._get_uwb()
         if uwb is None or not self._uwb_valid_and_fresh():
             self._publish_velocity(0.0, 0.0, 0.0)
-            if self._is_uwb_approach_land_mode():
+            if self._is_uwb_staged_mode():
                 if self._uwb_missing_start_time is None:
                     self._uwb_missing_start_time = now
                     self.get_logger().warn("No fresh UWB data during approach, hovering")
@@ -2199,9 +2384,9 @@ class TestMissionNode(Node):
 
         vx = 0.0
         vy = 0.0
-        stop_radius = self.uwb_capture_radius_m if self._is_uwb_approach_land_mode() else self.horizontal_deadband
+        stop_radius = self.uwb_capture_radius_m if self._is_uwb_staged_mode() else self.horizontal_deadband
         speed_limit = self.max_vel_xy
-        if self._is_uwb_approach_land_mode() and horizontal_dist <= self.uwb_slow_radius_m:
+        if self._is_uwb_staged_mode() and horizontal_dist <= self.uwb_slow_radius_m:
             speed_limit = min(speed_limit, self.uwb_slow_max_vel_xy)
         if horizontal_dist > stop_radius:
             vx = clamp(
@@ -2215,7 +2400,7 @@ class TestMissionNode(Node):
                 speed_limit,
             )
 
-        if self._is_uwb_approach_land_mode():
+        if self._is_uwb_staged_mode():
             rel_alt, alt_source = self._get_takeoff_land_relative_altitude()
             alt_err = 0.0 if rel_alt is None else self.takeoff_altitude - rel_alt
         else:
@@ -2227,13 +2412,21 @@ class TestMissionNode(Node):
         radius = self._mission_xy_distance_from_origin()
         region = "LEGACY"
         region_reason = "legacy"
-        if self._is_uwb_approach_land_mode():
+        if self._is_uwb_staged_mode():
             region, region_reason = self._uwb_classify_region(geom)
-            region_elapsed = self._uwb_update_region_hold(now, region)
             geometry_ok = region != "INVALID_HOLD"
             if self._uwb_front_line_locked and geometry_ok and region == "SIDE_REAR_SCAN":
                 region = "FRONT_LINE_LOCKED"
                 region_reason = "front_line_locked_ignore_lateral"
+            if (
+                self._uwb_front_line_locked
+                and geometry_ok
+                and region != "CENTER_CAPTURE"
+                and self._uwb_near_center_protection_geometry_ok(geom)
+            ):
+                region = "NEAR_CENTER_HOLD"
+                region_reason = "center_high_elevation_protect"
+            region_elapsed = self._uwb_update_region_hold(now, region)
             front_region_ok = region == "FRONT_APPROACH"
             tight_front_ok = (
                 front_region_ok
@@ -2244,10 +2437,14 @@ class TestMissionNode(Node):
                 and
                 horizontal_dist <= self.uwb_capture_radius_m
                 and abs(azimuth) <= self.uwb_capture_front_sector_deg
+                and (
+                    not self._uwb_front_line_locked
+                    or abs(forward_dist) <= self.uwb_preland_max_abs_forward_m
+                )
             )
             center_capture_geometry_ok = region == "CENTER_CAPTURE"
             capture_geometry_ok = normal_capture_geometry_ok or center_capture_geometry_ok
-            capture_mode = "center" if center_capture_geometry_ok and not normal_capture_geometry_ok else "normal"
+            capture_mode = "center" if center_capture_geometry_ok else "normal"
             if not geometry_ok:
                 self._uwb_capture_start_time = None
                 self._uwb_capture_mode = None
@@ -2289,16 +2486,37 @@ class TestMissionNode(Node):
                 self._uwb_capture_start_time = None
                 self._uwb_capture_mode = None
                 self._uwb_out_of_front_start_time = None
+                if (
+                    region_elapsed >= self.uwb_center_stable_sec
+                    and self._uwb_near_center_hold_ready(geom)
+                ):
+                    self._uwb_target_captured = True
+                    self._uwb_approach_ok = True
+                    self._publish_velocity(0.0, 0.0, vz, frame_id="body", immediate=True)
+                    self._publish_event("uwb_near_center_held")
+                    self.get_logger().info(
+                        f"UWB region={region}: near center held, hovering above target "
+                        f"reason={region_reason} az={azimuth:.1f}deg "
+                        f"raw_az={raw_azimuth:.1f}deg raw_el={elevation:.1f}deg "
+                        f"body_el={body_elevation:.1f}deg hdist={horizontal_dist:.2f}m "
+                        f"body_dist=({forward_dist:.2f},{lateral_dist:.2f},{vertical_dist:.2f}) "
+                        f"stable={region_elapsed:.1f}/{self.uwb_center_stable_sec:.1f}s"
+                    )
+                    self._transition(Phase.HOVER_ABOVE)
+                    return
                 creep_vx = 0.0
                 action = "HOLD"
                 if (
                     self._uwb_front_line_locked
-                    and forward_dist > self.uwb_capture_radius_m
+                    and forward_dist > self.uwb_preland_max_abs_forward_m
                     and self.uwb_center_creep_speed_mps > 0.0
                 ):
                     creep_vx = min(self.uwb_center_creep_speed_mps, speed_limit)
                     action = "CREEP_FORWARD"
-                self._publish_velocity(creep_vx, 0.0, vz, frame_id="body", immediate=True)
+                trim_vy, lat_trim_active = self._uwb_preland_lateral_trim(geom)
+                if lat_trim_active:
+                    action = f"{action}+TRIM_LATERAL" if action != "HOLD" else "TRIM_LATERAL"
+                self._publish_velocity(creep_vx, trim_vy, vz, frame_id="body", immediate=True)
                 self.get_logger().info(
                     f"UWB region={region}: reason={region_reason} "
                     f"az={azimuth:.1f}deg raw_az={raw_azimuth:.1f}deg raw_el={elevation:.1f}deg "
@@ -2306,7 +2524,8 @@ class TestMissionNode(Node):
                     f"body_dist=({forward_dist:.2f},{lateral_dist:.2f},{vertical_dist:.2f}) "
                     f"stable={region_elapsed:.1f}/{self.uwb_center_stable_sec:.1f}s "
                     f"front_line_locked={self._uwb_front_line_locked} "
-                    f"action={action} cmd_body=({creep_vx:.2f},0.00,{vz:.2f})",
+                    f"action={action} cmd_body=({creep_vx:.2f},{trim_vy:.2f},{vz:.2f}) "
+                    f"lat_trim={lat_trim_active}",
                     throttle_duration_sec=0.5,
                 )
                 return
@@ -2456,7 +2675,7 @@ class TestMissionNode(Node):
             self._uwb_capture_mode = None
 
         if (
-            self._is_uwb_approach_land_mode()
+            self._is_uwb_staged_mode()
             and radius is not None
             and radius >= self.mission_soft_radius_m
         ):
@@ -2469,16 +2688,22 @@ class TestMissionNode(Node):
             )
             return
 
-        if self._is_uwb_approach_land_mode() and self._uwb_front_line_locked:
-            if horizontal_dist > stop_radius:
+        lat_trim_active = False
+        if self._is_uwb_staged_mode() and self._uwb_front_line_locked:
+            if forward_dist > self.uwb_preland_max_abs_forward_m:
                 vx = clamp(
-                    self.kp_horizontal * max(forward_dist, 0.0),
+                    self.kp_horizontal * forward_dist,
                     0.0,
                     speed_limit,
                 )
+            elif (
+                horizontal_dist <= self.uwb_center_hold_hdist_m
+                and forward_dist < -self.uwb_preland_max_abs_forward_m
+            ):
+                vx = 0.0
             else:
                 vx = 0.0
-            vy = 0.0
+            vy, lat_trim_active = self._uwb_preland_lateral_trim(geom)
 
         self._publish_velocity(vx, vy, vz, frame_id="body")
 
@@ -2488,7 +2713,7 @@ class TestMissionNode(Node):
                 f"Above target: az={azimuth:.1f}deg hdist={horizontal_dist:.2f}m",
                 "above_target_reached",
             )
-            if self.phase == Phase.HOVER_ABOVE and self._is_uwb_approach_land_mode():
+            if self.phase == Phase.HOVER_ABOVE and self._is_uwb_staged_mode():
                 self._uwb_approach_ok = True
         else:
             self.hover_start_time = None
@@ -2501,6 +2726,7 @@ class TestMissionNode(Node):
                 f"body_dist=({forward_dist:.2f},{lateral_dist:.2f},{vertical_dist:.2f}) "
                 f"rel_alt={alt_text} ({alt_source}) "
                 f"cmd_body=({vx:.2f},{vy:.2f},{vz:.2f}) speed_limit={speed_limit:.2f} "
+                f"lat_trim={lat_trim_active} "
                 f"front_line_locked={self._uwb_front_line_locked} "
                 f"front_limit={self.uwb_approach_front_sector_deg:.1f}deg "
                 f"line_lock={self.uwb_front_line_lock_deg:.1f}deg "
@@ -2509,7 +2735,7 @@ class TestMissionNode(Node):
             )
 
     def _tick_uwb_scan_yaw(self):
-        if not self._is_uwb_approach_land_mode():
+        if not self._is_uwb_staged_mode():
             self._transition(Phase.MOVE_ABOVE)
             return
 
@@ -2675,26 +2901,214 @@ class TestMissionNode(Node):
             throttle_duration_sec=1.0,
         )
 
+    def _uwb_hover_geometry(self, now):
+        uwb = self._get_uwb()
+        if uwb is None or not self._uwb_valid_and_fresh():
+            return None
+        raw_azimuth, distance, elevation = uwb
+        geom = self._uwb_smoothed_geometry(now, raw_azimuth, distance, elevation)
+        region, region_reason = self._uwb_classify_region(geom)
+        return geom, region, region_reason, raw_azimuth, elevation
+
+    def _uwb_preland_lateral_trim(self, geom):
+        if (
+            geom["horizontal_dist"] > self.uwb_preland_lateral_enable_hdist_m
+            or geom["body_elevation"] < self.uwb_preland_lateral_min_body_elevation_deg
+            or abs(geom["lateral_dist"]) <= self.uwb_preland_lateral_deadband_m
+            or self.uwb_preland_max_lateral_speed_mps <= 0.0
+            or self.uwb_preland_lateral_kp <= 0.0
+        ):
+            return 0.0, False
+        vy = clamp(
+            -self.uwb_preland_lateral_kp * geom["lateral_dist"],
+            -self.uwb_preland_max_lateral_speed_mps,
+            self.uwb_preland_max_lateral_speed_mps,
+        )
+        return vy, abs(vy) > 0.0
+
+    def _uwb_near_center_protection_geometry_ok(self, geom):
+        return (
+            self._uwb_front_stable_once
+            and geom["body_elevation"] >= self.uwb_center_min_body_elevation_deg
+            and geom["horizontal_dist"] <= self.uwb_preland_lateral_enable_hdist_m
+        )
+
+    def _uwb_near_center_hold_ready(self, geom):
+        raw_elevation = geom["elevation"]
+        return (
+            self._uwb_near_center_protection_geometry_ok(geom)
+            and geom["horizontal_dist"] <= self.uwb_preland_hdist_m
+            and abs(geom["forward_dist"]) <= self.uwb_preland_max_abs_forward_m
+            and abs(geom["lateral_dist"]) <= self.uwb_preland_max_abs_lateral_m
+            and self.uwb_center_raw_elevation_min_deg
+            <= raw_elevation
+            <= self.uwb_center_raw_elevation_max_deg
+        )
+
+    def _uwb_center_confirmed_for_preland(self, geom):
+        raw_elevation = geom["elevation"]
+        return (
+            geom["body_elevation"] >= self.uwb_center_capture_body_elevation_deg
+            and geom["horizontal_dist"] <= self.uwb_preland_hdist_m
+            and abs(geom["forward_dist"]) <= self.uwb_preland_max_abs_forward_m
+            and abs(geom["lateral_dist"]) <= self.uwb_preland_max_abs_lateral_m
+            and self.uwb_center_raw_elevation_min_deg
+            <= raw_elevation
+            <= self.uwb_center_raw_elevation_max_deg
+        )
+
+    def _uwb_hover_status_text(self, hover_geom):
+        if hover_geom is None:
+            return " UWB=stale"
+        geom, region, region_reason, raw_azimuth, elevation = hover_geom
+        return (
+            f" UWB={region}/{region_reason} "
+            f"az={geom['body_azimuth']:.1f}deg raw_az={raw_azimuth:.1f}deg "
+            f"raw_el={elevation:.1f}deg body_el={geom['body_elevation']:.1f}deg "
+            f"hdist={geom['horizontal_dist']:.2f}m "
+            f"body_dist=({geom['forward_dist']:.2f},"
+            f"{geom['lateral_dist']:.2f},{geom['vertical_dist']:.2f})"
+        )
+
     def _tick_hover_above(self):
-        if self._is_uwb_approach_land_mode():
-            self._publish_velocity(0.0, 0.0, 0.0, immediate=True)
+        if self._is_uwb_staged_mode():
             now = self.get_clock().now()
+            hover_geom = self._uwb_hover_geometry(now)
+            uwb_text = self._uwb_hover_status_text(hover_geom)
             if self.hover_start_time is None:
                 self.hover_start_time = now
+                self._uwb_preland_stable_start_time = None
+                self._uwb_preland_timeout_hold_start_time = None
                 self.get_logger().info(
-                    f"UWB target hover started, holding "
-                    f"{self.uwb_target_hover_time_sec:.1f}s before LAND"
+                    f"UWB preland settle started: stable_required="
+                    f"{self.uwb_preland_stable_sec:.1f}s timeout="
+                    f"{self.uwb_preland_timeout_sec:.1f}s hold_timeout="
+                    f"{self.uwb_preland_timeout_hold_sec:.1f}s{uwb_text}"
                 )
                 return
             elapsed = (now - self.hover_start_time).nanoseconds / 1e9
-            if elapsed >= self.uwb_target_hover_time_sec:
-                self.get_logger().info("UWB target hover stable, landing")
+            hold_elapsed = 0.0
+            hold_active = self._uwb_preland_timeout_hold_start_time is not None
+            if hold_active:
+                hold_elapsed = (
+                    now - self._uwb_preland_timeout_hold_start_time
+                ).nanoseconds / 1e9
+
+            vx = 0.0
+            vy = 0.0
+            lat_trim_active = False
+            center_confirmed = False
+            stable_elapsed = 0.0
+            hdist_ok = False
+            fwd_ok = False
+            lat_ok = False
+            raw_el_ok = False
+            if hover_geom is not None:
+                geom = hover_geom[0]
+                raw_elevation = geom["elevation"]
+                hdist_ok = geom["horizontal_dist"] <= self.uwb_preland_hdist_m
+                fwd_ok = abs(geom["forward_dist"]) <= self.uwb_preland_max_abs_forward_m
+                lat_ok = abs(geom["lateral_dist"]) <= self.uwb_preland_max_abs_lateral_m
+                raw_el_ok = (
+                    self.uwb_center_raw_elevation_min_deg
+                    <= raw_elevation
+                    <= self.uwb_center_raw_elevation_max_deg
+                )
+                center_confirmed = self._uwb_center_confirmed_for_preland(geom)
+                if center_confirmed:
+                    if self._uwb_preland_stable_start_time is None:
+                        self._uwb_preland_stable_start_time = now
+                    stable_elapsed = (
+                        now - self._uwb_preland_stable_start_time
+                    ).nanoseconds / 1e9
+                else:
+                    self._uwb_preland_stable_start_time = None
+                    if (
+                        geom["horizontal_dist"] <= self.uwb_center_hold_hdist_m
+                        and abs(geom["forward_dist"])
+                        > self.uwb_preland_max_abs_forward_m
+                        and geom["forward_dist"] > 0.0
+                    ):
+                        vx = clamp(
+                            self.kp_horizontal * geom["forward_dist"],
+                            0.0,
+                            self.uwb_center_creep_speed_mps,
+                        )
+                    vy, lat_trim_active = self._uwb_preland_lateral_trim(geom)
+            else:
+                self._uwb_preland_stable_start_time = None
+
+            self._publish_velocity(vx, vy, 0.0, frame_id="body", immediate=True)
+
+            if center_confirmed and stable_elapsed >= self.uwb_preland_stable_sec:
+                next_phase = Phase.DESCEND if self._is_uwb_grasp_return_land_mode() else Phase.LAND
+                next_text = "descending for grasp" if next_phase == Phase.DESCEND else "landing"
+                self.get_logger().info(
+                    f"UWB preland center confirmed, {next_text} stable="
+                    f"{stable_elapsed:.1f}s cmd_body=({vx:.2f},{vy:.2f},0.00) "
+                    f"lat_trim={lat_trim_active}{uwb_text}"
+                )
                 self._publish_event("uwb_target_hover_done")
-                self._transition(Phase.LAND)
+                self._transition(next_phase)
+                return
+            if elapsed >= self.uwb_preland_timeout_sec:
+                reason = f"UWB preland settle timeout after {elapsed:.1f}s"
+                if self._is_uwb_grasp_return_land_mode():
+                    if self._uwb_preland_timeout_hold_start_time is None:
+                        self._uwb_preland_timeout_hold_start_time = now
+                        self._publish_event("uwb_preland_timeout")
+                        self._publish_event("uwb_preland_timeout_hold")
+                        self.get_logger().warn(
+                            f"{reason}; holding and retrying center confirmation for "
+                            f"{self.uwb_preland_timeout_hold_sec:.1f}s "
+                            f"center_confirmed={center_confirmed} hdist_ok={hdist_ok} "
+                            f"fwd_ok={fwd_ok} lat_ok={lat_ok} raw_el_ok={raw_el_ok} "
+                            f"cmd_body=({vx:.2f},{vy:.2f},0.00) "
+                            f"lat_trim={lat_trim_active}{uwb_text}"
+                        )
+                    elif hold_elapsed >= self.uwb_preland_timeout_hold_sec:
+                        self._takeoff_land_abort_reason = (
+                            f"{reason}; preland hold timeout after "
+                            f"{hold_elapsed:.1f}s"
+                        )
+                        self._publish_event("uwb_preland_hold_timeout")
+                        self.get_logger().error(
+                            f"{self._takeoff_land_abort_reason}; entering FAILSAFE "
+                            f"center_confirmed={center_confirmed} hdist_ok={hdist_ok} "
+                            f"fwd_ok={fwd_ok} lat_ok={lat_ok} raw_el_ok={raw_el_ok} "
+                            f"cmd_body=({vx:.2f},{vy:.2f},0.00) "
+                            f"lat_trim={lat_trim_active}{uwb_text}"
+                        )
+                        self._transition(Phase.FAILSAFE)
+                        return
+                    else:
+                        self.get_logger().info(
+                            f"UWB preland timeout hold {hold_elapsed:.1f}/"
+                            f"{self.uwb_preland_timeout_hold_sec:.1f}s stable="
+                            f"{stable_elapsed:.1f}/{self.uwb_preland_stable_sec:.1f}s "
+                            f"center_confirmed={center_confirmed} "
+                            f"hdist_ok={hdist_ok} fwd_ok={fwd_ok} lat_ok={lat_ok} "
+                            f"raw_el_ok={raw_el_ok} "
+                            f"cmd_body=({vx:.2f},{vy:.2f},0.00) "
+                            f"lat_trim={lat_trim_active}{uwb_text}",
+                            throttle_duration_sec=0.5,
+                        )
+                else:
+                    self.get_logger().warn(
+                        f"{reason}; "
+                        f"cmd_body=({vx:.2f},{vy:.2f},0.00) "
+                        f"lat_trim={lat_trim_active}{uwb_text}"
+                    )
+                    self._publish_event("uwb_preland_timeout")
+                    self._transition(Phase.LAND)
                 return
             self.get_logger().info(
-                f"UWB target hover holding {elapsed:.1f}/"
-                f"{self.uwb_target_hover_time_sec:.1f}s before LAND",
+                f"UWB preland settling {elapsed:.1f}/"
+                f"{self.uwb_preland_timeout_sec:.1f}s stable="
+                f"{stable_elapsed:.1f}/{self.uwb_preland_stable_sec:.1f}s "
+                f"center_confirmed={center_confirmed} "
+                f"hdist_ok={hdist_ok} fwd_ok={fwd_ok} lat_ok={lat_ok} raw_el_ok={raw_el_ok} "
+                f"cmd_body=({vx:.2f},{vy:.2f},0.00) lat_trim={lat_trim_active}{uwb_text}",
                 throttle_duration_sec=0.5,
             )
             return
@@ -2707,6 +3121,34 @@ class TestMissionNode(Node):
         if self.use_mock:
             self._check_stable_and_transition(
                 Phase.HOVER_FINAL, "Mock descent complete", "final_altitude_reached"
+            )
+            return
+
+        if self._is_uwb_grasp_return_land_mode():
+            rel_alt, source = self._get_takeoff_land_relative_altitude()
+            if rel_alt is None:
+                self._publish_velocity(0.0, 0.0, 0.0, frame_id="body")
+                self.hover_start_time = None
+                self.get_logger().warn(
+                    "UWB grasp descend waiting for relative altitude source...",
+                    throttle_duration_sec=1.0,
+                )
+                return
+            alt_err = self.descend_altitude - rel_alt
+            vz = clamp(self.kp_vertical * alt_err, -self.max_vel_z, self.max_vel_z)
+            self._publish_velocity(0.0, 0.0, vz, frame_id="body")
+            if abs(alt_err) <= self.altitude_tolerance:
+                self._check_stable_and_transition(
+                    Phase.HOVER_FINAL,
+                    f"UWB grasp low altitude stable at rel_alt={rel_alt:.2f}m ({source})",
+                    "uwb_grasp_low_altitude_reached",
+                )
+                return
+            self.hover_start_time = None
+            self.get_logger().info(
+                f"UWB grasp descending: rel_alt={rel_alt:.2f}/{self.descend_altitude:.2f}m "
+                f"({source}) cmd_body=(0.00,0.00,{vz:.2f})",
+                throttle_duration_sec=1.0,
             )
             return
 
@@ -2753,6 +3195,8 @@ class TestMissionNode(Node):
 
     def _tick_wait_grasp(self):
         self._publish_velocity(0.0, 0.0, 0.0)
+        if self._is_uwb_grasp_return_land_mode():
+            self._publish_grasp_command_once()
         if self.fake_grasp:
             if self.grasp_start_time is None:
                 self.grasp_start_time = self.get_clock().now()
@@ -2760,11 +3204,13 @@ class TestMissionNode(Node):
             elapsed = (self.get_clock().now() - self.grasp_start_time).nanoseconds / 1e9
             if elapsed >= self.fake_grasp_delay_sec:
                 self._publish_event("grasp_complete")
+                self._mission_grasp_ok = True
                 self._transition(Phase.CLIMB)
             return
 
         if self._grasp_done:
             self._publish_event("grasp_complete")
+            self._mission_grasp_ok = True
             self._transition(Phase.CLIMB)
             return
 
@@ -2789,6 +3235,34 @@ class TestMissionNode(Node):
             self._check_stable_and_transition(Phase.HOVER_CLIMB, "Mock climb complete", "climb_done")
             return
 
+        if self._is_uwb_grasp_return_land_mode():
+            rel_alt, source = self._get_takeoff_land_relative_altitude()
+            if rel_alt is None:
+                self._publish_velocity(0.0, 0.0, 0.0, frame_id="body")
+                self.hover_start_time = None
+                self.get_logger().warn(
+                    "UWB grasp reclimb waiting for relative altitude source...",
+                    throttle_duration_sec=1.0,
+                )
+                return
+            alt_err = self.takeoff_altitude - rel_alt
+            vz = clamp(self.kp_vertical * alt_err, -self.max_vel_z, self.max_vel_z)
+            self._publish_velocity(0.0, 0.0, vz, frame_id="body")
+            if abs(alt_err) <= self.altitude_tolerance:
+                self._check_stable_and_transition(
+                    Phase.HOVER_CLIMB,
+                    f"UWB grasp reclimb stable at rel_alt={rel_alt:.2f}m ({source})",
+                    "uwb_grasp_reclimb_done",
+                )
+                return
+            self.hover_start_time = None
+            self.get_logger().info(
+                f"UWB grasp reclimbing: rel_alt={rel_alt:.2f}/{self.takeoff_altitude:.2f}m "
+                f"({source}) cmd_body=(0.00,0.00,{vz:.2f})",
+                throttle_duration_sec=1.0,
+            )
+            return
+
         alt = self._get_fcu_altitude()
         alt_err = self.takeoff_altitude - alt
         vz = 0.0
@@ -2804,6 +3278,26 @@ class TestMissionNode(Node):
 
     def _tick_hover_climb(self):
         self._publish_velocity(0.0, 0.0, 0.0)
+        if self._is_uwb_grasp_return_land_mode():
+            if self.hover_start_time is None:
+                self.hover_start_time = self.get_clock().now()
+                self.get_logger().info(
+                    f"UWB grasp reclimb hover started, holding {self.return_hover_time:.1f}s before return"
+                )
+                return
+            elapsed = (self.get_clock().now() - self.hover_start_time).nanoseconds / 1e9
+            if elapsed >= self.return_hover_time:
+                self.get_logger().info(
+                    "UWB grasp reclimb hover stable, switching MAVROS velocity frame to LOCAL_NED for return"
+                )
+                self._publish_event("uwb_grasp_reclimb_hover_done")
+                self._start_mav_frame_switch("LOCAL_NED", Phase.WAYPOINT_RETURN)
+                return
+            self.get_logger().info(
+                f"UWB grasp reclimb hover holding {elapsed:.1f}/{self.return_hover_time:.1f}s",
+                throttle_duration_sec=1.0,
+            )
+            return
         self._check_stable_and_transition(
             Phase.RETURN, "Climb hover stable, returning", "hover_climb_done"
         )
@@ -2854,6 +3348,8 @@ class TestMissionNode(Node):
 
     def _tick_wait_drop(self):
         self._publish_velocity(0.0, 0.0, 0.0)
+        if self._is_uwb_grasp_return_land_mode():
+            self._publish_drop_command_once()
         if self.fake_drop:
             if self.drop_start_time is None:
                 self.drop_start_time = self.get_clock().now()
@@ -2861,11 +3357,13 @@ class TestMissionNode(Node):
             elapsed = (self.get_clock().now() - self.drop_start_time).nanoseconds / 1e9
             if elapsed >= self.fake_drop_delay_sec:
                 self._publish_event("drop_complete")
+                self._mission_drop_ok = True
                 self._transition(Phase.LAND)
             return
 
         if self._drop_done:
             self._publish_event("drop_complete")
+            self._mission_drop_ok = True
             self._transition(Phase.LAND)
             return
 
@@ -3012,8 +3510,9 @@ class TestMissionNode(Node):
 
     def _tick_paused_manual(self):
         self._publish_velocity(0.0, 0.0, 0.0, immediate=True)
+        reason = self._manual_pause_reason or "RC/mode takeover"
         self.get_logger().warn(
-            "Mission paused by RC/mode takeover. Restart mission node to resume autonomy.",
+            f"Mission paused: {reason}. Restart mission node to resume autonomy.",
             throttle_duration_sec=5.0,
         )
 
@@ -3114,8 +3613,13 @@ class TestMissionNode(Node):
         self.hover_start_time = None
         if new_phase != Phase.WAIT_GRASP:
             self.grasp_start_time = None
+            self._grasp_command_sent = False
         if new_phase != Phase.WAIT_DROP:
             self.drop_start_time = None
+            self._drop_command_sent = False
+        if new_phase != Phase.HOVER_ABOVE:
+            self._uwb_preland_stable_start_time = None
+            self._uwb_preland_timeout_hold_start_time = None
         if new_phase != Phase.TAKEOFF:
             self._takeoff_wait_start_time = None
             self._takeoff_delay_start_time = None
@@ -3221,7 +3725,7 @@ class TestMissionNode(Node):
             return "preflight_wait:fcu"
         if not snapshot["rc_ok"]:
             return "preflight_wait:rc_manual_input"
-        if self._is_uwb_approach_land_mode() and not snapshot["uwb_ok"]:
+        if self._is_uwb_staged_mode() and not snapshot["uwb_ok"]:
             return "preflight_wait:uwb"
         if not snapshot["pose_ok"]:
             return "preflight_wait:local_pose"
