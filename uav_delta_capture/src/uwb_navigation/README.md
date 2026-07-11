@@ -40,6 +40,7 @@ source /workspace/uav_delta_capture/install/setup.bash
 | `takeoff_waypoint_return_land` | `test_mission_takeoff_waypoint_return_land.launch.py` | `test_mission_takeoff_waypoint_return_land.yaml` | FCU、测距、光流、本地位置 | 低高度 GUIDED 起飞、按起飞时机头方向定义目标点、返回起点、降落 |
 | `uwb_approach_land` | `test_mission_uwb_approach_land.launch.py` | `test_mission_uwb_approach_land.yaml` | 完整硬件 | 低高度速度起飞、UWB 接近 tag 上方；目标不在前向扇区时原地偏航扫描，捕获后悬停降落 |
 | `uwb_approach_grasp_return_land` | `test_mission_uwb_grasp_return_land.launch.py` | `test_mission_uwb_grasp_return_land.yaml` | 完整硬件+机械臂 | 复用 staged UWB 接近，tag 上方下降等待抓取，复飞后用 local_position 返航，投放后降落 |
+| `uwb_approach_grasp_return_land` | `test_mission_uwb_grasp_return_land_arm_dev.launch.py` | `test_mission_uwb_grasp_return_land_arm_dev.yaml` | 真实机械臂联调 | 从稳定完整流程复制出的隔离入口，后续机械臂话题/节点联调只改这一版 |
 | `real_full` | `test_mission_real_full.launch.py` | `test_mission_real.yaml` | 完整硬件 | 完整起飞、UWB 接近、下降、抓取占位、返航、投放占位、降落 |
 
 `test_mission_real.launch.py` 目前是兼容旧命名的 bench 入口，实际等价于 `test_mission_bench.launch.py`。

@@ -304,6 +304,16 @@ docker exec -it ros2humble bash -lc "
 "
 ```
 
+真实机械臂联调隔离入口，基于上面稳定版复制，后续机械臂话题或节点集成只改 arm-dev 配置/launch：
+
+```bash
+docker exec -it ros2humble bash -lc "
+  source /opt/ros/humble/setup.bash
+  source /workspace/uav_delta_capture/install/setup.bash
+  ros2 launch uwb_navigation test_mission_uwb_grasp_return_land_arm_dev.launch.py
+"
+```
+
 关键日志：
 
 ```text
@@ -339,6 +349,9 @@ docker exec ros2humble bash -lc "grep -E 'UWB approach-land preflight|UWB_APPROA
 
 # UWB 抓取返航完整任务后台日志
 docker exec ros2humble bash -lc "grep -E 'UWB grasp-return-land preflight|UWB_GRASP_RETURN_LAND RESULT|Core links|Sensor links|Phase|Takeoff OK|UWB approach|UWB preland|Publishing grasp|grasp_complete|Waypoint return|Publishing drop|drop_complete|Landing complete|LAND_WAIT|FAILSAFE|ERROR|WARN' /tmp/mission_uwb_grasp_return_land.log | tail -220"
+
+# UWB 抓取返航真实机械臂联调入口后台日志
+docker exec ros2humble bash -lc "grep -E 'UWB grasp-return-land preflight|UWB_GRASP_RETURN_LAND RESULT|Core links|Sensor links|Phase|UWB yaw scan|UWB approach|UWB preland|Publishing grasp|Received grasp_done|grasp_done accepted|Waypoint return|Publishing drop|Received drop_done|drop_done accepted|LAND_WAIT|FAILSAFE|ERROR|WARN' /tmp/mission_uwb_grasp_return_land_arm_dev.log | tail -260"
 
 # GUIDED 定位前进降落后台日志
 docker exec ros2humble bash -lc "grep -E 'Takeoff-forward-land preflight|TAKEOFF_FORWARD_LAND RESULT|Core links|Sensor links|Phase|Takeoff OK|Forward moving|Forward target|Landing complete|LAND_WAIT|FAILSAFE|ERROR|WARN' /tmp/mission_takeoff_forward_land.log | tail -180"
