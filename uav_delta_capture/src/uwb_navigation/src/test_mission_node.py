@@ -132,6 +132,7 @@ class TestMissionNode(Node):
         self.fake_drop = self.declare_parameter("fake_drop", True).value
         self.fake_drop_delay_sec = self.declare_parameter("fake_drop_delay_sec", 2.0).value
         self.drop_timeout_sec = self.declare_parameter("drop_timeout_sec", 10.0).value
+        self.enable_drop_stage = self.declare_parameter("enable_drop_stage", True).value
         self.grasp_done_topic = self.declare_parameter("grasp_done_topic", "grasp_done").value
         self.drop_done_topic = self.declare_parameter("drop_done_topic", "drop_done").value
         self.grasp_command_topic = self.declare_parameter(
@@ -570,6 +571,7 @@ class TestMissionNode(Node):
         self.origin_x = 0.0
         self.origin_y = 0.0
         self.origin_z = 0.0
+        self.origin_z_available = False
         self.origin_yaw = None
         self.origin_range = None
         self.origin_recorded = False
@@ -692,13 +694,19 @@ class TestMissionNode(Node):
         )
         self.link_sub = self.create_subscription(String, self.fcu_link_topic, self._link_callback, 10)
         self.grasp_sub = self.create_subscription(String, self.grasp_done_topic, self._grasp_callback, 10)
-        self.drop_sub = self.create_subscription(String, self.drop_done_topic, self._drop_callback, 10)
+        self.drop_sub = None
+        if self.enable_drop_stage:
+            self.drop_sub = self.create_subscription(
+                String, self.drop_done_topic, self._drop_callback, 10
+            )
 
         self.vel_pub = self.create_publisher(TwistStamped, self.cmd_vel_topic, 20)
         self.state_pub = self.create_publisher(String, self.mission_state_topic, 10)
         self.event_pub = self.create_publisher(String, self.mission_event_topic, 10)
         self.grasp_command_pub = self.create_publisher(String, self.grasp_command_topic, 10)
-        self.drop_command_pub = self.create_publisher(String, self.drop_command_topic, 10)
+        self.drop_command_pub = None
+        if self.enable_drop_stage:
+            self.drop_command_pub = self.create_publisher(String, self.drop_command_topic, 10)
         self.flight_reset_pub = self.create_publisher(String, "uav_bridge/flight_reset", 10)
 
         self.flight_cmd_client = self.create_client(
@@ -721,7 +729,8 @@ class TestMissionNode(Node):
             f"mock={str(self.use_mock).lower()} "
             f"takeoff={self.takeoff_altitude:.1f}m descend={self.descend_altitude:.1f}m "
             f"takeoff_method={self.takeoff_method} "
-            f"takeoff_delay={self.takeoff_command_delay_sec:.1f}s"
+            f"takeoff_delay={self.takeoff_command_delay_sec:.1f}s "
+            f"drop_stage={str(self.enable_drop_stage).lower()}"
         )
 
     def _parse_modes(self, modes_text):
@@ -807,7 +816,11 @@ class TestMissionNode(Node):
         self.get_logger().info(f"Publishing grasp command on {self.grasp_command_topic}: start_grasp")
 
     def _publish_drop_command_once(self):
-        if self._drop_command_sent:
+        if (
+            not self.enable_drop_stage
+            or self.drop_command_pub is None
+            or self._drop_command_sent
+        ):
             return
         msg = String()
         msg.data = "start_drop"
@@ -1182,10 +1195,23 @@ class TestMissionNode(Node):
             return max(0.0, range_m - self.origin_range), "rangefinder_rel"
 
         local_z = self._get_local_z()
-        if local_z is not None:
+        if local_z is not None and self.origin_z_available:
             return abs(local_z - self.origin_z), "local_z_rel"
 
         return None, "missing"
+
+    def _format_takeoff_altitude_diagnostics(self, rel_alt=None):
+        range_raw = self._get_rangefinder_m()
+        local_z = self._get_local_z()
+        range_raw_text = "none" if range_raw is None else f"{range_raw:.2f}"
+        origin_range_text = "none" if self.origin_range is None else f"{self.origin_range:.2f}"
+        local_z_text = "none" if local_z is None else f"{local_z:.2f}"
+        origin_z_text = "none" if not self.origin_z_available else f"{self.origin_z:.2f}"
+        rel_alt_text = "none" if rel_alt is None else f"{rel_alt:.2f}"
+        return (
+            f"range_raw={range_raw_text}m origin_range={origin_range_text}m "
+            f"range_rel={rel_alt_text}m local_z={local_z_text}m origin_z={origin_z_text}m"
+        )
 
     def _get_fcu_mode(self) -> str:
         with self._data_lock:
@@ -1427,7 +1453,7 @@ class TestMissionNode(Node):
                 and self._uwb_approach_ok
                 and self._mission_grasp_ok
                 and self._takeoff_land_guided_return_ok
-                and self._mission_drop_ok
+                and (not self.enable_drop_stage or self._mission_drop_ok)
             )
         sensor_ok = (
             snapshot["fcu_ok"]
@@ -1469,6 +1495,11 @@ class TestMissionNode(Node):
                 f"LAND={'OK' if self._takeoff_land_land_ok else 'FAIL'}"
             )
         elif self._is_uwb_grasp_return_land_mode():
+            drop_status = (
+                "SKIP"
+                if not self.enable_drop_stage
+                else ("OK" if self._mission_drop_ok else "FAIL")
+            )
             core_text = (
                 "Core links: "
                 f"ARM={'OK' if self._bench_arm_ok else 'FAIL'} "
@@ -1477,7 +1508,7 @@ class TestMissionNode(Node):
                 f"UWB_APPROACH={'OK' if self._uwb_approach_ok else 'FAIL'} "
                 f"GRASP={'OK' if self._mission_grasp_ok else 'FAIL'} "
                 f"RETURN={'OK' if self._takeoff_land_guided_return_ok else 'FAIL'} "
-                f"DROP={'OK' if self._mission_drop_ok else 'FAIL'} "
+                f"DROP={drop_status} "
                 f"LAND={'OK' if self._takeoff_land_land_ok else 'FAIL'}"
             )
         elif self._is_takeoff_forward_land_mode():
@@ -1733,10 +1764,28 @@ class TestMissionNode(Node):
             self._transition(Phase.HOVER_TAKEOFF)
             return
 
+        takeoff_command_altitude = float(self.takeoff_altitude)
+        if self._is_takeoff_land_mode():
+            current_local_z = self._get_local_z()
+            if not self.origin_z_available or current_local_z is None:
+                reason = "TAKEOFF blocked: local altitude origin is unavailable"
+                self.get_logger().error(reason)
+                self._takeoff_land_abort_reason = reason
+                self._transition(Phase.FAILSAFE)
+                return
+
+            takeoff_command_altitude = self.origin_z + float(self.takeoff_altitude)
+            self.get_logger().info(
+                f"Requesting MAVROS relative takeoff: requested_rel="
+                f"{self.takeoff_altitude:.2f}m service_target={takeoff_command_altitude:.2f}m "
+                f"current_local_z={current_local_z:.2f}m "
+                f"{self._format_takeoff_altitude_diagnostics(0.0)}"
+            )
+
         self._pending_command = True
         self._call_flight_cmd(
             FlightCommand.Request.CMD_TAKEOFF,
-            float(self.takeoff_altitude),
+            takeoff_command_altitude,
             self._on_takeoff_result,
         )
 
@@ -1849,7 +1898,8 @@ class TestMissionNode(Node):
                 self._publish_velocity(0.0, 0.0, 0.0)
                 reason = (
                     f"TAKEOFF height timeout: rel_alt={rel_alt:.2f}/"
-                    f"{self.takeoff_altitude:.2f}m ({source})"
+                    f"{self.takeoff_altitude:.2f}m ({source}); "
+                    f"{self._format_takeoff_altitude_diagnostics(rel_alt)}"
                 )
                 self.get_logger().error(reason)
                 self._takeoff_land_abort_reason = reason
@@ -1868,7 +1918,8 @@ class TestMissionNode(Node):
 
             self.get_logger().info(
                 f"Waiting for MAVROS takeoff height: rel_alt={rel_alt:.2f}/"
-                f"{self.takeoff_altitude:.2f}m threshold={takeoff_ready_alt:.2f}m ({source})",
+                f"{self.takeoff_altitude:.2f}m threshold={takeoff_ready_alt:.2f}m ({source}); "
+                f"{self._format_takeoff_altitude_diagnostics(rel_alt)}",
                 throttle_duration_sec=1.0,
             )
             return
@@ -3365,8 +3416,17 @@ class TestMissionNode(Node):
 
     def _tick_hover_return(self):
         self._publish_velocity(0.0, 0.0, 0.0)
+        if self.enable_drop_stage:
+            self._check_stable_and_transition(
+                Phase.WAIT_DROP,
+                "Hover above origin stable, waiting for drop",
+                "hover_return_done",
+            )
+            return
         self._check_stable_and_transition(
-            Phase.WAIT_DROP, "Hover above origin stable, waiting for drop", "hover_return_done"
+            Phase.LAND,
+            "Hover above origin stable, drop stage disabled; landing",
+            "hover_return_direct_land",
         )
 
     def _tick_wait_drop(self):
@@ -3606,6 +3666,7 @@ class TestMissionNode(Node):
         local_z = self._get_local_z()
         if local_z is not None:
             self.origin_z = local_z
+            self.origin_z_available = True
         self.origin_yaw = self._get_local_yaw()
         self.origin_range = self._get_rangefinder_m()
         self.origin_recorded = True
