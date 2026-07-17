@@ -23,8 +23,6 @@ test_mission_node:
     takeoff_altitude: 0.85
     takeoff_method: mavros
     takeoff_climb_velocity: 0.12
-    takeoff_mavros_assist_enabled: true
-    takeoff_mavros_assist_delay_sec: 2.5
     takeoff_command_delay_sec: 1.5
     takeoff_height_timeout_sec: 25.0
     descend_altitude: 0.6
@@ -35,7 +33,7 @@ test_mission_node:
     max_vel_z: 0.15
     velocity_slew_rate: 0.2
     altitude_tolerance: 0.12
-    takeoff_transition_tolerance: 0.12
+    takeoff_transition_tolerance: 0.20
     control_rate_hz: 20.0
     land_ground_rel_alt_threshold: 0.12
     land_ground_stable_sec: 1.5

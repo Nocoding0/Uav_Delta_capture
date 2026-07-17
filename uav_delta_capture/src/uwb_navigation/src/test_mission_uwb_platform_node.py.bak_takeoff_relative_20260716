@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""UWB mission node.
+"""Isolated UWB platform grasp-return mission node.
 
 Mission modes:
   - mock_full: pure software flow test.
@@ -8,7 +8,8 @@ Mission modes:
   - takeoff_forward_land: low GUIDED takeoff, body-forward local-position move, hover, land.
   - takeoff_waypoint_return_land: low GUIDED takeoff, local-position waypoint, return, land.
   - uwb_approach_land: low GUIDED takeoff, UWB approach to tag, hover, land.
-  - real_full: take off, UWB approach, descend, fake/real grasp, climb, return, drop, land.
+  - uwb_approach_grasp_return_land: UWB approach, verify a raised platform,
+    descend for grasp, climb, return, and land without a drop stage.
 """
 
 import math
@@ -72,6 +73,9 @@ class Phase(Enum):
     WAYPOINT_RECLIMB = 30
     HOVER_WAYPOINT_RECLIMB = 31
     UWB_SCAN_YAW = 32
+    PLATFORM_VERIFY = 33
+    PLATFORM_EXIT_VERIFY = 34
+    ABORT_RETURN = 35
 
 
 PHASE_NAMES = {phase: phase.name for phase in Phase}
@@ -85,9 +89,9 @@ def string_is_done(value: str) -> bool:
     return value.strip().upper() in {"1", "TRUE", "OK", "DONE", "COMPLETE", "SUCCESS"}
 
 
-class TestMissionNode(Node):
+class PlatformMissionNode(Node):
     def __init__(self):
-        super().__init__("test_mission_node")
+        super().__init__("test_mission_uwb_platform_node")
 
         self.uwb_aoa_topic = self.declare_parameter("uwb_aoa_topic", "uwb_aoa/data").value
         self.fcu_state_topic = self.declare_parameter("fcu_state_topic", "fcu_state").value
@@ -146,12 +150,6 @@ class TestMissionNode(Node):
         self.descend_altitude = self.declare_parameter("descend_altitude", 0.5).value
         self.takeoff_method = self.declare_parameter("takeoff_method", "mavros").value
         self.takeoff_climb_velocity = self.declare_parameter("takeoff_climb_velocity", 0.12).value
-        self.takeoff_mavros_assist_enabled = self.declare_parameter(
-            "takeoff_mavros_assist_enabled", False
-        ).value
-        self.takeoff_mavros_assist_delay_sec = self.declare_parameter(
-            "takeoff_mavros_assist_delay_sec", 2.5
-        ).value
         self.takeoff_command_delay_sec = self.declare_parameter(
             "takeoff_command_delay_sec", 1.5
         ).value
@@ -382,6 +380,77 @@ class TestMissionNode(Node):
             "bench_exit_on_complete", True
         ).value
 
+        # Fixed demonstration platform: 0.565m x 0.42m x 0.40m.
+        self.platform_expected_height_m = self.declare_parameter(
+            "platform_expected_height_m", 0.40
+        ).value
+        self.platform_height_tolerance_m = self.declare_parameter(
+            "platform_height_tolerance_m", 0.06
+        ).value
+        self.platform_expected_cruise_clearance_m = self.declare_parameter(
+            "platform_expected_cruise_clearance_m", 0.45
+        ).value
+        self.platform_detect_enable_hdist_m = self.declare_parameter(
+            "platform_detect_enable_hdist_m", 0.65
+        ).value
+        self.platform_center_hdist_m = self.declare_parameter(
+            "platform_center_hdist_m", 0.16
+        ).value
+        self.platform_center_max_abs_forward_m = self.declare_parameter(
+            "platform_center_max_abs_forward_m", 0.14
+        ).value
+        self.platform_center_max_abs_lateral_m = self.declare_parameter(
+            "platform_center_max_abs_lateral_m", 0.14
+        ).value
+        self.platform_range_stable_sec = self.declare_parameter(
+            "platform_range_stable_sec", 1.0
+        ).value
+        self.platform_range_stability_m = self.declare_parameter(
+            "platform_range_stability_m", 0.03
+        ).value
+        self.platform_range_timeout_sec = self.declare_parameter(
+            "platform_range_timeout_sec", 0.30
+        ).value
+        self.platform_verify_timeout_sec = self.declare_parameter(
+            "platform_verify_timeout_sec", 5.0
+        ).value
+        self.platform_flow_min_quality = self.declare_parameter(
+            "platform_flow_min_quality", 30
+        ).value
+        self.platform_flow_timeout_sec = self.declare_parameter(
+            "platform_flow_timeout_sec", 0.50
+        ).value
+        self.platform_grasp_clearance_m = self.declare_parameter(
+            "platform_grasp_clearance_m", 0.15
+        ).value
+        self.platform_grasp_tolerance_m = self.declare_parameter(
+            "platform_grasp_tolerance_m", 0.03
+        ).value
+        self.platform_min_clearance_m = self.declare_parameter(
+            "platform_min_clearance_m", 0.10
+        ).value
+        self.platform_descend_max_speed_mps = self.declare_parameter(
+            "platform_descend_max_speed_mps", 0.05
+        ).value
+        self.platform_low_hover_stable_sec = self.declare_parameter(
+            "platform_low_hover_stable_sec", 1.0
+        ).value
+        self.platform_exit_range_threshold_m = self.declare_parameter(
+            "platform_exit_range_threshold_m", 0.65
+        ).value
+        self.platform_return_max_speed_mps = self.declare_parameter(
+            "platform_return_max_speed_mps", 0.10
+        ).value
+        self.platform_failure_hold_sec = self.declare_parameter(
+            "platform_failure_hold_sec", 2.0
+        ).value
+        self.platform_allow_descend = self.declare_parameter(
+            "platform_allow_descend", False
+        ).value
+        self.platform_verify_only_hold_sec = self.declare_parameter(
+            "platform_verify_only_hold_sec", 3.0
+        ).value
+
         self.takeoff_altitude = max(0.5, self.takeoff_altitude)
         self.descend_altitude = max(0.2, self.descend_altitude)
         self.takeoff_method = str(self.takeoff_method).strip().lower()
@@ -389,10 +458,6 @@ class TestMissionNode(Node):
             self.takeoff_method = "mavros"
         self.takeoff_climb_velocity = clamp(
             abs(float(self.takeoff_climb_velocity)), 0.03, 0.25
-        )
-        self.takeoff_mavros_assist_enabled = bool(self.takeoff_mavros_assist_enabled)
-        self.takeoff_mavros_assist_delay_sec = max(
-            0.0, float(self.takeoff_mavros_assist_delay_sec)
         )
         self.takeoff_command_delay_sec = max(0.0, float(self.takeoff_command_delay_sec))
         self.takeoff_height_timeout_sec = max(1.0, float(self.takeoff_height_timeout_sec))
@@ -575,6 +640,75 @@ class TestMissionNode(Node):
         self.return_hover_time = max(0.2, float(self.return_hover_time))
         self.low_hover_time = max(0.2, float(self.low_hover_time))
         self.target_hover_time = max(0.2, float(self.target_hover_time))
+        self.platform_expected_height_m = clamp(
+            float(self.platform_expected_height_m), 0.08, 0.50
+        )
+        self.platform_height_tolerance_m = clamp(
+            abs(float(self.platform_height_tolerance_m)), 0.02, 0.15
+        )
+        self.platform_expected_cruise_clearance_m = max(
+            0.20, float(self.platform_expected_cruise_clearance_m)
+        )
+        self.platform_detect_enable_hdist_m = max(
+            self.platform_center_hdist_m,
+            float(self.platform_detect_enable_hdist_m),
+        )
+        self.platform_center_hdist_m = clamp(
+            float(self.platform_center_hdist_m), 0.08, 0.20
+        )
+        self.platform_center_max_abs_forward_m = clamp(
+            abs(float(self.platform_center_max_abs_forward_m)), 0.05, 0.18
+        )
+        self.platform_center_max_abs_lateral_m = clamp(
+            abs(float(self.platform_center_max_abs_lateral_m)), 0.05, 0.18
+        )
+        self.platform_range_stable_sec = max(0.3, float(self.platform_range_stable_sec))
+        self.platform_range_stability_m = clamp(
+            abs(float(self.platform_range_stability_m)), 0.01, 0.08
+        )
+        self.platform_range_timeout_sec = clamp(
+            float(self.platform_range_timeout_sec), 0.10, 1.0
+        )
+        self.platform_verify_timeout_sec = max(
+            self.platform_range_stable_sec,
+            float(self.platform_verify_timeout_sec),
+        )
+        self.platform_flow_min_quality = max(1, int(self.platform_flow_min_quality))
+        self.platform_flow_timeout_sec = clamp(
+            float(self.platform_flow_timeout_sec), 0.10, 2.0
+        )
+        self.platform_grasp_clearance_m = clamp(
+            float(self.platform_grasp_clearance_m), 0.10, 0.30
+        )
+        self.platform_grasp_tolerance_m = clamp(
+            abs(float(self.platform_grasp_tolerance_m)), 0.01, 0.08
+        )
+        self.platform_min_clearance_m = clamp(
+            float(self.platform_min_clearance_m),
+            0.05,
+            self.platform_grasp_clearance_m,
+        )
+        self.platform_descend_max_speed_mps = clamp(
+            abs(float(self.platform_descend_max_speed_mps)), 0.02, self.max_vel_z
+        )
+        self.platform_low_hover_stable_sec = max(
+            0.3, float(self.platform_low_hover_stable_sec)
+        )
+        self.platform_exit_range_threshold_m = max(
+            self.platform_expected_cruise_clearance_m
+            + self.platform_height_tolerance_m,
+            float(self.platform_exit_range_threshold_m),
+        )
+        self.platform_return_max_speed_mps = clamp(
+            abs(float(self.platform_return_max_speed_mps)), 0.03, self.max_vel_xy
+        )
+        self.platform_failure_hold_sec = max(
+            0.5, float(self.platform_failure_hold_sec)
+        )
+        self.platform_allow_descend = bool(self.platform_allow_descend)
+        self.platform_verify_only_hold_sec = max(
+            1.0, float(self.platform_verify_only_hold_sec)
+        )
 
         self.phase = Phase.INIT
         self.previous_flight_phase = Phase.INIT
@@ -654,7 +788,6 @@ class TestMissionNode(Node):
         self._takeoff_wait_start_time = None
         self._takeoff_delay_start_time = None
         self._takeoff_climb_start_time = None
-        self._takeoff_mavros_assist_started = False
         self._loiter_alt_loss_start_time = None
         self._move_above_start_time = None
         self._uwb_missing_start_time = None
@@ -686,6 +819,20 @@ class TestMissionNode(Node):
         self._land_disarm_retry_time = None
         self._manual_pause_reason = None
         self._shutdown_requested = False
+        self._platform_locked = False
+        self._platform_compensation_active = False
+        self._platform_measured_height_m = None
+        self._platform_resume_phase = None
+        self._platform_verify_start_time = None
+        self._platform_stable_start_time = None
+        self._platform_range_samples = []
+        self._platform_sensor_loss_start_time = None
+        self._platform_low_stable_start_time = None
+        self._platform_abort_alt_stable_start_time = None
+        self._platform_abort_return_active = False
+        self._platform_exit_start_time = None
+        self._platform_exit_stable_start_time = None
+        self._platform_verify_only_start_time = None
 
         cb_group = ReentrantCallbackGroup()
 
@@ -736,12 +883,13 @@ class TestMissionNode(Node):
         self.ctrl_timer = self.create_timer(ctrl_period, self._control_loop)
 
         self.get_logger().info(
-            f"test_mission_node started: mode={self.mission_mode} "
+            f"test_mission_uwb_platform_node started: mode={self.mission_mode} "
             f"mock={str(self.use_mock).lower()} "
-            f"takeoff={self.takeoff_altitude:.1f}m descend={self.descend_altitude:.1f}m "
+            f"takeoff={self.takeoff_altitude:.2f}m "
+            f"platform={self.platform_expected_height_m:.2f}m "
+            f"grasp_clearance={self.platform_grasp_clearance_m:.2f}m "
+            f"allow_descend={str(self.platform_allow_descend).lower()} "
             f"takeoff_method={self.takeoff_method} "
-            f"mavros_assist={str(self.takeoff_mavros_assist_enabled).lower()} "
-            f"assist_delay={self.takeoff_mavros_assist_delay_sec:.1f}s "
             f"takeoff_delay={self.takeoff_command_delay_sec:.1f}s "
             f"drop_stage={str(self.enable_drop_stage).lower()}"
         )
@@ -847,6 +995,10 @@ class TestMissionNode(Node):
             self._publish_state()
             return
 
+        if self._check_platform_sensor_guard():
+            self._publish_state()
+            return
+
         if self._pending_mode_target is not None:
             self._tick_pending_mode_switch()
             self._publish_state()
@@ -891,6 +1043,9 @@ class TestMissionNode(Node):
             Phase.HOVER_WAYPOINT_LOW: self._tick_hover_waypoint_low,
             Phase.WAYPOINT_RECLIMB: self._tick_waypoint_reclimb,
             Phase.HOVER_WAYPOINT_RECLIMB: self._tick_hover_waypoint_reclimb,
+            Phase.PLATFORM_VERIFY: self._tick_platform_verify,
+            Phase.PLATFORM_EXIT_VERIFY: self._tick_platform_exit_verify,
+            Phase.ABORT_RETURN: self._tick_abort_return,
         }
         tick_map[self.phase]()
         self._publish_state()
@@ -1202,7 +1357,271 @@ class TestMissionNode(Node):
                 return None
             return value
 
+    def _platform_range_state(self):
+        with self._data_lock:
+            msg = self._last_rangefinder
+            stamp = self._last_rangefinder_time
+        if msg is None:
+            return {
+                "ready": False,
+                "raw": None,
+                "clearance": None,
+                "age": None,
+                "reason": "missing",
+            }
+        age = (self.get_clock().now() - stamp).nanoseconds / 1e9
+        raw = float(msg.range)
+        if not math.isfinite(raw):
+            return {
+                "ready": False,
+                "raw": None,
+                "clearance": None,
+                "age": age,
+                "reason": "nonfinite",
+            }
+        if raw < msg.min_range or raw > msg.max_range:
+            return {
+                "ready": False,
+                "raw": raw,
+                "clearance": None,
+                "age": age,
+                "reason": "outside_sensor_range",
+            }
+        if age > self.platform_range_timeout_sec:
+            return {
+                "ready": False,
+                "raw": raw,
+                "clearance": None,
+                "age": age,
+                "reason": "stale",
+            }
+        if self.origin_range is None:
+            return {
+                "ready": False,
+                "raw": raw,
+                "clearance": None,
+                "age": age,
+                "reason": "origin_missing",
+            }
+        return {
+            "ready": True,
+            "raw": raw,
+            "clearance": max(0.0, raw - self.origin_range),
+            "age": age,
+            "reason": "ok",
+        }
+
+    def _platform_flow_state(self):
+        with self._data_lock:
+            msg = self._last_optical_flow
+            stamp = self._last_optical_flow_time
+        if msg is None:
+            return {"ready": False, "quality": None, "age": None, "reason": "missing"}
+        age = (self.get_clock().now() - stamp).nanoseconds / 1e9
+        quality = int(msg.quality)
+        if age > self.platform_flow_timeout_sec:
+            return {
+                "ready": False,
+                "quality": quality,
+                "age": age,
+                "reason": "stale",
+            }
+        if quality < self.platform_flow_min_quality:
+            return {
+                "ready": False,
+                "quality": quality,
+                "age": age,
+                "reason": "quality_low",
+            }
+        return {"ready": True, "quality": quality, "age": age, "reason": "ok"}
+
+    def _platform_update_range_samples(self, now, clearance):
+        now_ns = now.nanoseconds
+        if self._platform_stable_start_time is None:
+            self._platform_stable_start_time = now
+            self._platform_range_samples = []
+        self._platform_range_samples.append((now_ns, float(clearance)))
+        values = [sample[1] for sample in self._platform_range_samples]
+        if not values:
+            return 0.0, float("inf")
+        elapsed = (now - self._platform_stable_start_time).nanoseconds / 1e9
+        return elapsed, max(values) - min(values)
+
+    def _platform_reset_range_samples(self):
+        self._platform_range_samples = []
+        self._platform_stable_start_time = None
+
+    def _platform_virtual_altitude(self, clearance):
+        if self._platform_compensation_active:
+            return clearance + self.platform_expected_height_m
+        return clearance
+
+    def _platform_center_ready(self, geom):
+        return (
+            geom["horizontal_dist"] <= self.platform_center_hdist_m
+            and abs(geom["forward_dist"]) <= self.platform_center_max_abs_forward_m
+            and abs(geom["lateral_dist"]) <= self.platform_center_max_abs_lateral_m
+        )
+
+    def _platform_begin_verify(self, resume_phase, measured_height, reason):
+        self._platform_compensation_active = True
+        self._platform_measured_height_m = measured_height
+        self._platform_resume_phase = resume_phase
+        self._platform_verify_start_time = None
+        self._platform_reset_range_samples()
+        self._publish_velocity(0.0, 0.0, 0.0, frame_id="body", immediate=True)
+        self._publish_event("platform_candidate")
+        self.get_logger().warn(
+            f"Platform candidate: reason={reason} measured_height={measured_height:.2f}m "
+            f"expected={self.platform_expected_height_m:.2f}+/-"
+            f"{self.platform_height_tolerance_m:.2f}m "
+            f"resume={PHASE_NAMES[resume_phase]}; holding for verification"
+        )
+        self._transition(Phase.PLATFORM_VERIFY)
+
+    def _platform_maybe_begin_verify(self, geom, resume_phase):
+        if self._platform_locked or self._platform_compensation_active:
+            return False
+        if geom["horizontal_dist"] > self.platform_detect_enable_hdist_m:
+            return False
+        range_state = self._platform_range_state()
+        if not range_state["ready"]:
+            return False
+        clearance = range_state["clearance"]
+        measured_height = self.takeoff_altitude - clearance
+        candidate_tolerance = (
+            self.platform_height_tolerance_m + self.altitude_tolerance
+        )
+        if (
+            abs(measured_height - self.platform_expected_height_m)
+            <= candidate_tolerance
+        ):
+            self._platform_begin_verify(
+                resume_phase,
+                measured_height,
+                f"uwb_hdist={geom['horizontal_dist']:.2f}m "
+                f"clearance={clearance:.2f}m",
+            )
+            return True
+        if measured_height >= 0.08:
+            self.get_logger().warn(
+                f"Platform-like range step rejected: measured_height={measured_height:.2f}m "
+                f"expected={self.platform_expected_height_m:.2f}+/-"
+                f"{candidate_tolerance:.2f}m candidate_tolerance "
+                f"uwb_hdist={geom['horizontal_dist']:.2f}m",
+                throttle_duration_sec=1.0,
+            )
+        return False
+
+    def _platform_hold_sensor_failure(self, context, range_state, flow_state):
+        now = self.get_clock().now()
+        if self._platform_sensor_loss_start_time is None:
+            self._platform_sensor_loss_start_time = now
+        elapsed = (now - self._platform_sensor_loss_start_time).nanoseconds / 1e9
+        self._publish_velocity(0.0, 0.0, 0.0, immediate=True)
+        self.get_logger().warn(
+            f"{context} sensor hold: range={range_state['reason']} "
+            f"flow={flow_state['reason']} q={flow_state['quality']} "
+            f"elapsed={elapsed:.1f}/{self.platform_failure_hold_sec:.1f}s",
+            throttle_duration_sec=0.5,
+        )
+        if elapsed >= self.platform_failure_hold_sec:
+            self._platform_start_abort(
+                f"{context} sensors unavailable for {elapsed:.1f}s"
+            )
+        return True
+
+    def _platform_clear_compensation(self, reason):
+        measured = self._platform_measured_height_m
+        measured_text = "none" if measured is None else f"{measured:.2f}m"
+        self._platform_locked = False
+        self._platform_compensation_active = False
+        self._platform_measured_height_m = None
+        self._platform_reset_range_samples()
+        self.get_logger().info(
+            f"Platform compensation cleared: reason={reason} measured_height={measured_text}"
+        )
+
+    def _platform_start_abort(self, reason):
+        if self.phase in (Phase.ABORT_RETURN, Phase.FAILSAFE, Phase.LAND, Phase.LAND_WAIT):
+            return
+        self._takeoff_land_abort_reason = reason
+        self._platform_abort_return_active = True
+        self._platform_abort_alt_stable_start_time = None
+        self._publish_velocity(0.0, 0.0, 0.0, immediate=True)
+        self._publish_event("platform_abort")
+        range_state = self._platform_range_state()
+        if range_state["ready"] and not self._platform_compensation_active:
+            measured_height = self.takeoff_altitude - range_state["clearance"]
+            if (
+                abs(measured_height - self.platform_expected_height_m)
+                <= self.platform_height_tolerance_m + self.altitude_tolerance
+            ):
+                self._platform_compensation_active = True
+                self._platform_measured_height_m = measured_height
+                self.get_logger().warn(
+                    f"Platform compensation enabled for abort return: "
+                    f"measured_height={measured_height:.2f}m"
+                )
+        range_ok = range_state["ready"]
+        flow_ok = self._platform_flow_state()["ready"]
+        pose_ok = self._local_pose_ready()
+        if range_ok and flow_ok and pose_ok:
+            self.get_logger().error(f"{reason}; aborting grasp and returning home")
+            self._transition(Phase.ABORT_RETURN)
+            return
+        self.get_logger().error(
+            f"{reason}; return unavailable range_ok={range_ok} "
+            f"flow_ok={flow_ok} pose_ok={pose_ok}; entering FAILSAFE"
+        )
+        self._transition(Phase.FAILSAFE)
+
+    def _check_platform_sensor_guard(self):
+        if not self._platform_compensation_active:
+            self._platform_sensor_loss_start_time = None
+            return False
+        guarded_phases = {
+            Phase.MOVE_ABOVE,
+            Phase.UWB_SCAN_YAW,
+            Phase.CLIMB,
+            Phase.HOVER_CLIMB,
+            Phase.WAYPOINT_RETURN,
+        }
+        if self.phase not in guarded_phases:
+            self._platform_sensor_loss_start_time = None
+            return False
+        range_state = self._platform_range_state()
+        flow_state = self._platform_flow_state()
+        if range_state["ready"] and flow_state["ready"]:
+            self._platform_sensor_loss_start_time = None
+            return False
+        now = self.get_clock().now()
+        if self._platform_sensor_loss_start_time is None:
+            self._platform_sensor_loss_start_time = now
+        elapsed = (now - self._platform_sensor_loss_start_time).nanoseconds / 1e9
+        self._publish_velocity(0.0, 0.0, 0.0, immediate=True)
+        self.get_logger().warn(
+            f"Platform sensor hold: range={range_state['reason']} "
+            f"flow={flow_state['reason']} q={flow_state['quality']} "
+            f"elapsed={elapsed:.1f}/{self.platform_failure_hold_sec:.1f}s",
+            throttle_duration_sec=0.5,
+        )
+        if elapsed >= self.platform_failure_hold_sec:
+            self._platform_start_abort(
+                f"Platform navigation sensors unavailable for {elapsed:.1f}s"
+            )
+        return True
+
     def _get_takeoff_land_relative_altitude(self):
+        if self._platform_compensation_active:
+            range_state = self._platform_range_state()
+            if range_state["ready"]:
+                return (
+                    self._platform_virtual_altitude(range_state["clearance"]),
+                    "platform_virtual",
+                )
+            return None, "platform_range_missing"
+
         range_m = self._get_rangefinder_m()
         if range_m is not None and self.origin_range is not None:
             return max(0.0, range_m - self.origin_range), "rangefinder_rel"
@@ -1780,14 +2199,18 @@ class TestMissionNode(Node):
         takeoff_command_altitude = float(self.takeoff_altitude)
         if self._is_takeoff_land_mode():
             current_local_z = self._get_local_z()
-            current_local_z_text = (
-                "none" if current_local_z is None else f"{current_local_z:.2f}m"
-            )
+            if not self.origin_z_available or current_local_z is None:
+                reason = "TAKEOFF blocked: local altitude origin is unavailable"
+                self.get_logger().error(reason)
+                self._takeoff_land_abort_reason = reason
+                self._transition(Phase.FAILSAFE)
+                return
+
+            takeoff_command_altitude = self.origin_z + float(self.takeoff_altitude)
             self.get_logger().info(
-                f"Requesting MAVROS relative takeoff: target_rel="
-                f"{self.takeoff_altitude:.2f}m "
-                f"service_relative_target={takeoff_command_altitude:.2f}m "
-                f"current_local_z_diagnostic={current_local_z_text} "
+                f"Requesting MAVROS relative takeoff: requested_rel="
+                f"{self.takeoff_altitude:.2f}m service_target={takeoff_command_altitude:.2f}m "
+                f"current_local_z={current_local_z:.2f}m "
                 f"{self._format_takeoff_altitude_diagnostics(0.0)}"
             )
 
@@ -1921,26 +2344,6 @@ class TestMissionNode(Node):
                     f"Velocity takeoff climbing: rel_alt={rel_alt:.2f}/"
                     f"{self.takeoff_altitude:.2f}m ({source}) "
                     f"vz={self.takeoff_climb_velocity:.2f}m/s",
-                    throttle_duration_sec=1.0,
-                )
-                return
-
-            if (
-                self.takeoff_mavros_assist_enabled
-                and climb_elapsed >= self.takeoff_mavros_assist_delay_sec
-            ):
-                if not self._takeoff_mavros_assist_started:
-                    self._takeoff_mavros_assist_started = True
-                    self._publish_event("takeoff_mavros_assist_started")
-                    self.get_logger().warn(
-                        "MAVROS takeoff height is below the transition threshold; "
-                        "starting measured-height velocity assist"
-                    )
-                self._publish_velocity(0.0, 0.0, self.takeoff_climb_velocity)
-                self.get_logger().info(
-                    f"MAVROS takeoff assist climbing: rel_alt={rel_alt:.2f}/"
-                    f"{self.takeoff_altitude:.2f}m threshold={takeoff_ready_alt:.2f}m "
-                    f"({source}) vz={self.takeoff_climb_velocity:.2f}m/s",
                     throttle_duration_sec=1.0,
                 )
                 return
@@ -2266,6 +2669,26 @@ class TestMissionNode(Node):
             self._transition(next_phase)
             return
 
+        if self._platform_compensation_active:
+            range_state = self._platform_range_state()
+            if (
+                range_state["ready"]
+                and range_state["clearance"] >= self.platform_exit_range_threshold_m
+            ):
+                self._platform_resume_phase = Phase.WAYPOINT_RETURN
+                self._platform_exit_start_time = None
+                self._platform_reset_range_samples()
+                self._publish_velocity(0.0, 0.0, 0.0, immediate=True)
+                self._publish_event("platform_exit_candidate")
+                self.get_logger().warn(
+                    f"Platform exit candidate: clearance="
+                    f"{range_state['clearance']:.2f}m threshold="
+                    f"{self.platform_exit_range_threshold_m:.2f}m; "
+                    "holding before clearing compensation"
+                )
+                self._transition(Phase.PLATFORM_EXIT_VERIFY)
+                return
+
         reached = self._tick_local_waypoint(
             (self.origin_x, self.origin_y),
             "Waypoint return",
@@ -2346,8 +2769,11 @@ class TestMissionNode(Node):
         vx = self.kp_waypoint * err_x
         vy = self.kp_waypoint * err_y
         speed = math.sqrt(vx * vx + vy * vy)
-        if speed > self.waypoint_max_velocity:
-            scale = self.waypoint_max_velocity / speed
+        speed_limit = self.waypoint_max_velocity
+        if label == "Waypoint return":
+            speed_limit = min(speed_limit, self.platform_return_max_speed_mps)
+        if speed > speed_limit:
+            scale = speed_limit / speed
             vx *= scale
             vy *= scale
 
@@ -2483,6 +2909,9 @@ class TestMissionNode(Node):
         forward_dist = geom["forward_dist"]
         lateral_dist = geom["lateral_dist"]
         vertical_dist = geom["vertical_dist"]
+
+        if self._platform_maybe_begin_verify(geom, Phase.MOVE_ABOVE):
+            return
 
         vx = 0.0
         vy = 0.0
@@ -2877,11 +3306,13 @@ class TestMissionNode(Node):
         if uwb is not None and self._uwb_valid_and_fresh():
             raw_azimuth, distance, elevation = uwb
             geom = self._uwb_smoothed_geometry(now, raw_azimuth, distance, elevation)
+            if self._platform_maybe_begin_verify(geom, Phase.UWB_SCAN_YAW):
+                return
             azimuth = geom["body_azimuth"]
             body_elevation = geom["body_elevation"]
             horizontal_dist = geom["horizontal_dist"]
             region, region_reason = self._uwb_classify_region(geom)
-            region_elapsed = self._uwb_update_region_hold(now, region)
+            self._uwb_update_region_hold(now, region)
 
             if region == "INVALID_HOLD":
                 self._uwb_scan_lock_start_time = None
@@ -3072,6 +3503,273 @@ class TestMissionNode(Node):
             f"{geom['lateral_dist']:.2f},{geom['vertical_dist']:.2f})"
         )
 
+    def _tick_platform_verify(self):
+        if self.use_mock:
+            self._platform_compensation_active = True
+            self._platform_locked = True
+            next_phase = self._platform_resume_phase or Phase.HOVER_ABOVE
+            self.get_logger().info(
+                f"Mock platform verified, resuming {PHASE_NAMES[next_phase]}"
+            )
+            self._transition(next_phase)
+            return
+
+        now = self.get_clock().now()
+        if self._platform_verify_start_time is None:
+            self._platform_verify_start_time = now
+            self._platform_reset_range_samples()
+            self.get_logger().info(
+                f"Platform verification started: expected_height="
+                f"{self.platform_expected_height_m:.2f}m expected_clearance="
+                f"{self.platform_expected_cruise_clearance_m:.2f}m "
+                f"stable={self.platform_range_stable_sec:.1f}s "
+                f"timeout={self.platform_verify_timeout_sec:.1f}s"
+            )
+
+        elapsed = (now - self._platform_verify_start_time).nanoseconds / 1e9
+        range_state = self._platform_range_state()
+        flow_state = self._platform_flow_state()
+
+        if range_state["ready"] and not self._platform_compensation_active:
+            measured_height = self.takeoff_altitude - range_state["clearance"]
+            if (
+                abs(measured_height - self.platform_expected_height_m)
+                <= self.platform_height_tolerance_m + self.altitude_tolerance
+            ):
+                self._platform_compensation_active = True
+                self._platform_measured_height_m = measured_height
+                self._publish_event("platform_candidate_late")
+                self.get_logger().warn(
+                    f"Platform candidate acquired during verification: "
+                    f"height={measured_height:.2f}m "
+                    f"clearance={range_state['clearance']:.2f}m"
+                )
+
+        vz = 0.0
+        virtual_alt = None
+        if range_state["ready"] and self._platform_compensation_active:
+            virtual_alt = self._platform_virtual_altitude(range_state["clearance"])
+            alt_err = self.takeoff_altitude - virtual_alt
+            vz = clamp(
+                self.kp_vertical * alt_err,
+                -self.platform_descend_max_speed_mps,
+                self.platform_descend_max_speed_mps,
+            )
+
+        clearance_ok = bool(
+            range_state["ready"]
+            and abs(
+                range_state["clearance"] - self.platform_expected_cruise_clearance_m
+            )
+            <= self.platform_height_tolerance_m
+        )
+        stable_elapsed = 0.0
+        spread = float("inf")
+        if (
+            clearance_ok
+            and flow_state["ready"]
+            and self._platform_compensation_active
+        ):
+            stable_elapsed, spread = self._platform_update_range_samples(
+                now, range_state["clearance"]
+            )
+        else:
+            self._platform_reset_range_samples()
+
+        stable = (
+            stable_elapsed >= self.platform_range_stable_sec
+            and spread <= self.platform_range_stability_m
+        )
+        self._publish_velocity(0.0, 0.0, vz, frame_id="body", immediate=True)
+        if stable:
+            self._platform_locked = True
+            self._platform_sensor_loss_start_time = None
+            next_phase = self._platform_resume_phase or Phase.HOVER_ABOVE
+            self._platform_resume_phase = None
+            self._publish_event("platform_locked")
+            self.get_logger().info(
+                f"Platform locked: measured_height="
+                f"{self._platform_measured_height_m:.2f}m "
+                f"clearance={range_state['clearance']:.2f}m "
+                f"virtual_alt={virtual_alt:.2f}m spread={spread:.3f}m "
+                f"flow_q={flow_state['quality']} resuming={PHASE_NAMES[next_phase]}"
+            )
+            self._transition(next_phase)
+            return
+
+        if elapsed >= self.platform_verify_timeout_sec:
+            self._platform_start_abort(
+                f"Platform verification timeout after {elapsed:.1f}s "
+                f"range={range_state['reason']} flow={flow_state['reason']} "
+                f"clearance_ok={clearance_ok} spread="
+                f"{'none' if not math.isfinite(spread) else f'{spread:.3f}'}"
+            )
+            return
+
+        clearance_text = (
+            "none"
+            if range_state["clearance"] is None
+            else f"{range_state['clearance']:.2f}"
+        )
+        virtual_text = "none" if virtual_alt is None else f"{virtual_alt:.2f}"
+        spread_text = "none" if not math.isfinite(spread) else f"{spread:.3f}"
+        self.get_logger().info(
+            f"Platform verifying {elapsed:.1f}/{self.platform_verify_timeout_sec:.1f}s "
+            f"clearance={clearance_text}m virtual_alt={virtual_text}m "
+            f"range={range_state['reason']} flow={flow_state['reason']} "
+            f"q={flow_state['quality']} stable="
+            f"{stable_elapsed:.1f}/{self.platform_range_stable_sec:.1f}s "
+            f"spread={spread_text}m cmd_body=(0.00,0.00,{vz:.2f})",
+            throttle_duration_sec=0.5,
+        )
+
+    def _tick_platform_exit_verify(self):
+        if self.use_mock:
+            self._platform_clear_compensation("mock platform exit")
+            next_phase = self._platform_resume_phase or Phase.WAYPOINT_RETURN
+            self._platform_resume_phase = None
+            self._transition(next_phase)
+            return
+
+        now = self.get_clock().now()
+        if self._platform_exit_start_time is None:
+            self._platform_exit_start_time = now
+            self._platform_reset_range_samples()
+            self.get_logger().info(
+                f"Platform exit verification started: threshold="
+                f"{self.platform_exit_range_threshold_m:.2f}m"
+            )
+        elapsed = (now - self._platform_exit_start_time).nanoseconds / 1e9
+        range_state = self._platform_range_state()
+        flow_state = self._platform_flow_state()
+        stable_elapsed = 0.0
+        spread = float("inf")
+        if (
+            range_state["ready"]
+            and flow_state["ready"]
+            and range_state["clearance"] >= self.platform_exit_range_threshold_m
+        ):
+            stable_elapsed, spread = self._platform_update_range_samples(
+                now, range_state["clearance"]
+            )
+        else:
+            self._platform_reset_range_samples()
+
+        self._publish_velocity(0.0, 0.0, 0.0, immediate=True)
+        if (
+            stable_elapsed >= self.platform_range_stable_sec
+            and spread <= max(0.05, self.platform_range_stability_m)
+        ):
+            next_phase = self._platform_resume_phase or Phase.WAYPOINT_RETURN
+            self._platform_resume_phase = None
+            clearance = range_state["clearance"]
+            self._platform_clear_compensation("stable floor range detected")
+            self._publish_event("platform_exit_confirmed")
+            self.get_logger().info(
+                f"Platform exit confirmed: floor_clearance={clearance:.2f}m "
+                f"spread={spread:.3f}m flow_q={flow_state['quality']} "
+                f"resuming={PHASE_NAMES[next_phase]}"
+            )
+            self._transition(next_phase)
+            return
+
+        if elapsed >= self.platform_verify_timeout_sec:
+            if (
+                range_state["ready"]
+                and flow_state["ready"]
+                and self._local_pose_ready()
+                and range_state["clearance"] >= self.platform_exit_range_threshold_m
+            ):
+                next_phase = self._platform_resume_phase or Phase.WAYPOINT_RETURN
+                self._platform_resume_phase = None
+                self.get_logger().warn(
+                    f"Platform exit timeout after {elapsed:.1f}s; "
+                    f"forcing compensation clear with fresh floor-like range"
+                )
+                self._platform_clear_compensation("exit timeout with floor-like range")
+                self._publish_event("platform_exit_forced")
+                self._transition(next_phase)
+                return
+            self._takeoff_land_abort_reason = (
+                f"Platform exit verification failed after {elapsed:.1f}s"
+            )
+            self.get_logger().error(
+                f"{self._takeoff_land_abort_reason}; entering FAILSAFE "
+                f"range={range_state['reason']} flow={flow_state['reason']}"
+            )
+            self._transition(Phase.FAILSAFE)
+            return
+
+        clearance_text = (
+            "none"
+            if range_state["clearance"] is None
+            else f"{range_state['clearance']:.2f}"
+        )
+        spread_text = "none" if not math.isfinite(spread) else f"{spread:.3f}"
+        self.get_logger().info(
+            f"Platform exit verifying {elapsed:.1f}/"
+            f"{self.platform_verify_timeout_sec:.1f}s "
+            f"clearance={clearance_text}m range={range_state['reason']} "
+            f"flow={flow_state['reason']} q={flow_state['quality']} "
+            f"stable={stable_elapsed:.1f}/{self.platform_range_stable_sec:.1f}s "
+            f"spread={spread_text}m",
+            throttle_duration_sec=0.5,
+        )
+
+    def _tick_abort_return(self):
+        if self.use_mock:
+            self._start_mav_frame_switch("LOCAL_NED", Phase.WAYPOINT_RETURN)
+            return
+        range_state = self._platform_range_state()
+        flow_state = self._platform_flow_state()
+        if (
+            not range_state["ready"]
+            or not flow_state["ready"]
+            or not self._local_pose_ready()
+        ):
+            self.get_logger().error(
+                f"Abort return lost positioning: range={range_state['reason']} "
+                f"flow={flow_state['reason']} pose={self._local_pose_ready()}; "
+                "entering FAILSAFE"
+            )
+            self._transition(Phase.FAILSAFE)
+            return
+
+        rel_alt, source = self._get_takeoff_land_relative_altitude()
+        if rel_alt is None:
+            self._publish_velocity(0.0, 0.0, 0.0, immediate=True)
+            self.get_logger().warn(
+                "Abort return waiting for platform-aware altitude",
+                throttle_duration_sec=0.5,
+            )
+            return
+        alt_err = self.takeoff_altitude - rel_alt
+        vz = clamp(self.kp_vertical * alt_err, -self.max_vel_z, self.max_vel_z)
+        self._publish_velocity(0.0, 0.0, vz, frame_id="body", immediate=True)
+        now = self.get_clock().now()
+        if abs(alt_err) <= self.altitude_tolerance:
+            if self._platform_abort_alt_stable_start_time is None:
+                self._platform_abort_alt_stable_start_time = now
+            stable_elapsed = (
+                now - self._platform_abort_alt_stable_start_time
+            ).nanoseconds / 1e9
+            if stable_elapsed >= self.platform_low_hover_stable_sec:
+                self.get_logger().warn(
+                    f"Abort return altitude stable at {rel_alt:.2f}m ({source}); "
+                    "switching to LOCAL_NED and returning home"
+                )
+                self._publish_event("platform_abort_return")
+                self._start_mav_frame_switch("LOCAL_NED", Phase.WAYPOINT_RETURN)
+                return
+        else:
+            self._platform_abort_alt_stable_start_time = None
+        self.get_logger().info(
+            f"Abort return preparing: rel_alt={rel_alt:.2f}/"
+            f"{self.takeoff_altitude:.2f}m ({source}) "
+            f"cmd_body=(0.00,0.00,{vz:.2f})",
+            throttle_duration_sec=0.5,
+        )
+
     def _tick_hover_above(self):
         if self._is_uwb_staged_mode():
             now = self.get_clock().now()
@@ -3116,7 +3814,10 @@ class TestMissionNode(Node):
                     <= raw_elevation
                     <= self.uwb_center_raw_elevation_max_deg
                 )
-                center_confirmed = self._uwb_center_confirmed_for_preland(geom)
+                center_confirmed = (
+                    self._uwb_center_confirmed_for_preland(geom)
+                    and self._platform_center_ready(geom)
+                )
                 if center_confirmed:
                     if self._uwb_preland_stable_start_time is None:
                         self._uwb_preland_stable_start_time = now
@@ -3143,8 +3844,72 @@ class TestMissionNode(Node):
             self._publish_velocity(vx, vy, 0.0, frame_id="body", immediate=True)
 
             if center_confirmed and stable_elapsed >= self.uwb_preland_stable_sec:
-                next_phase = Phase.DESCEND if self._is_uwb_grasp_return_land_mode() else Phase.LAND
-                next_text = "descending for grasp" if next_phase == Phase.DESCEND else "landing"
+                if self._is_uwb_grasp_return_land_mode() and not self._platform_locked:
+                    range_state = self._platform_range_state()
+                    if range_state["ready"]:
+                        measured_height = self.takeoff_altitude - range_state["clearance"]
+                        if (
+                            abs(measured_height - self.platform_expected_height_m)
+                            <= self.platform_height_tolerance_m
+                        ):
+                            self._platform_begin_verify(
+                                Phase.HOVER_ABOVE,
+                                measured_height,
+                                "UWB center confirmed before platform lock",
+                            )
+                            return
+                    self._platform_resume_phase = Phase.HOVER_ABOVE
+                    self._platform_verify_start_time = None
+                    self._platform_reset_range_samples()
+                    self._publish_event("platform_verify_requested")
+                    self.get_logger().warn(
+                        "UWB center confirmed but platform is not locked; "
+                        "holding for platform verification"
+                    )
+                    self._transition(Phase.PLATFORM_VERIFY)
+                    return
+
+                if (
+                    self._is_uwb_grasp_return_land_mode()
+                    and not self.platform_allow_descend
+                ):
+                    if self._platform_verify_only_start_time is None:
+                        self._platform_verify_only_start_time = now
+                        self._publish_event("platform_descent_inhibited")
+                        self.get_logger().warn(
+                            "Platform and UWB center verified; descent is disabled "
+                            "for this validation run"
+                        )
+                    gate_elapsed = (
+                        now - self._platform_verify_only_start_time
+                    ).nanoseconds / 1e9
+                    self._publish_velocity(
+                        0.0, 0.0, 0.0, frame_id="body", immediate=True
+                    )
+                    if gate_elapsed >= self.platform_verify_only_hold_sec:
+                        self._platform_start_abort(
+                            "Platform verification-only run complete; "
+                            "platform_allow_descend=false"
+                        )
+                        return
+                    self.get_logger().info(
+                        f"Platform validation hold {gate_elapsed:.1f}/"
+                        f"{self.platform_verify_only_hold_sec:.1f}s; "
+                        "descent inhibited",
+                        throttle_duration_sec=0.5,
+                    )
+                    return
+
+                next_phase = (
+                    Phase.DESCEND
+                    if self._is_uwb_grasp_return_land_mode()
+                    else Phase.LAND
+                )
+                next_text = (
+                    "descending for platform grasp"
+                    if next_phase == Phase.DESCEND
+                    else "landing"
+                )
                 self.get_logger().info(
                     f"UWB preland center confirmed, {next_text} stable="
                     f"{stable_elapsed:.1f}s cmd_body=({vx:.2f},{vy:.2f},0.00) "
@@ -3227,30 +3992,89 @@ class TestMissionNode(Node):
             return
 
         if self._is_uwb_grasp_return_land_mode():
-            rel_alt, source = self._get_takeoff_land_relative_altitude()
-            if rel_alt is None:
-                self._publish_velocity(0.0, 0.0, 0.0, frame_id="body")
-                self.hover_start_time = None
+            if not self._platform_locked:
+                self._platform_start_abort(
+                    "Platform grasp descent requested without a locked platform"
+                )
+                return
+            now = self.get_clock().now()
+            range_state = self._platform_range_state()
+            flow_state = self._platform_flow_state()
+            if not range_state["ready"] or not flow_state["ready"]:
+                if self._platform_sensor_loss_start_time is None:
+                    self._platform_sensor_loss_start_time = now
+                loss_elapsed = (
+                    now - self._platform_sensor_loss_start_time
+                ).nanoseconds / 1e9
+                self._publish_velocity(0.0, 0.0, 0.0, frame_id="body", immediate=True)
+                self._platform_low_stable_start_time = None
+                self._platform_reset_range_samples()
                 self.get_logger().warn(
-                    "UWB grasp descend waiting for relative altitude source...",
-                    throttle_duration_sec=1.0,
+                    f"Platform descend sensor hold: range={range_state['reason']} "
+                    f"flow={flow_state['reason']} q={flow_state['quality']} "
+                    f"elapsed={loss_elapsed:.1f}/{self.platform_failure_hold_sec:.1f}s",
+                    throttle_duration_sec=0.5,
                 )
+                if loss_elapsed >= self.platform_failure_hold_sec:
+                    self._platform_start_abort(
+                        f"Platform descend sensors unavailable for {loss_elapsed:.1f}s"
+                    )
                 return
-            alt_err = self.descend_altitude - rel_alt
-            vz = clamp(self.kp_vertical * alt_err, -self.max_vel_z, self.max_vel_z)
-            self._publish_velocity(0.0, 0.0, vz, frame_id="body")
-            if abs(alt_err) <= self.altitude_tolerance:
-                self._check_stable_and_transition(
-                    Phase.HOVER_FINAL,
-                    f"UWB grasp low altitude stable at rel_alt={rel_alt:.2f}m ({source})",
-                    "uwb_grasp_low_altitude_reached",
+
+            self._platform_sensor_loss_start_time = None
+            clearance = range_state["clearance"]
+            alt_err = self.platform_grasp_clearance_m - clearance
+            if clearance <= self.platform_min_clearance_m:
+                vz = min(self.platform_descend_max_speed_mps, 0.03)
+                self.get_logger().error(
+                    f"Platform clearance safety limit reached: "
+                    f"{clearance:.2f}<={self.platform_min_clearance_m:.2f}m; climbing"
                 )
+            else:
+                vz = clamp(
+                    self.kp_vertical * alt_err,
+                    -self.platform_descend_max_speed_mps,
+                    self.platform_descend_max_speed_mps,
+                )
+            self._publish_velocity(0.0, 0.0, vz, frame_id="body", immediate=True)
+
+            stable_elapsed = 0.0
+            spread = float("inf")
+            if abs(alt_err) <= self.platform_grasp_tolerance_m:
+                if self._platform_low_stable_start_time is None:
+                    self._platform_low_stable_start_time = now
+                    self._platform_reset_range_samples()
+                stable_elapsed = (
+                    now - self._platform_low_stable_start_time
+                ).nanoseconds / 1e9
+                _, spread = self._platform_update_range_samples(now, clearance)
+            else:
+                self._platform_low_stable_start_time = None
+                self._platform_reset_range_samples()
+
+            if (
+                stable_elapsed >= self.platform_low_hover_stable_sec
+                and spread <= self.platform_range_stability_m
+            ):
+                self._platform_low_stable_start_time = None
+                self._platform_reset_range_samples()
+                self.get_logger().info(
+                    f"Platform grasp clearance reached: clearance={clearance:.2f}/"
+                    f"{self.platform_grasp_clearance_m:.2f}m "
+                    f"spread={spread:.3f}m flow_q={flow_state['quality']}"
+                )
+                self._publish_event("platform_grasp_clearance_reached")
+                self._transition(Phase.HOVER_FINAL)
                 return
-            self.hover_start_time = None
+
+            spread_text = "none" if not math.isfinite(spread) else f"{spread:.3f}"
             self.get_logger().info(
-                f"UWB grasp descending: rel_alt={rel_alt:.2f}/{self.descend_altitude:.2f}m "
-                f"({source}) cmd_body=(0.00,0.00,{vz:.2f})",
-                throttle_duration_sec=1.0,
+                f"Platform grasp descending: clearance={clearance:.2f}/"
+                f"{self.platform_grasp_clearance_m:.2f}m "
+                f"stable={stable_elapsed:.1f}/{self.platform_low_hover_stable_sec:.1f}s "
+                f"spread={spread_text}m flow_q={flow_state['quality']} "
+                f"cmd_body=(0.00,0.00,{vz:.2f})",
+                throttle_duration_sec=0.5,
             )
             return
 
@@ -3290,13 +4114,81 @@ class TestMissionNode(Node):
             self.hover_start_time = None
 
     def _tick_hover_final(self):
+        if self._is_uwb_grasp_return_land_mode() and self._platform_locked:
+            now = self.get_clock().now()
+            range_state = self._platform_range_state()
+            flow_state = self._platform_flow_state()
+            if not range_state["ready"] or not flow_state["ready"]:
+                self._platform_low_stable_start_time = None
+                self._platform_hold_sensor_failure(
+                    "Platform final hover", range_state, flow_state
+                )
+                return
+            self._platform_sensor_loss_start_time = None
+            clearance = range_state["clearance"]
+            alt_err = self.platform_grasp_clearance_m - clearance
+            vz = clamp(
+                self.kp_vertical * alt_err,
+                -self.platform_descend_max_speed_mps,
+                self.platform_descend_max_speed_mps,
+            )
+            self._publish_velocity(0.0, 0.0, vz, frame_id="body", immediate=True)
+            if abs(alt_err) <= self.platform_grasp_tolerance_m:
+                if self._platform_low_stable_start_time is None:
+                    self._platform_low_stable_start_time = now
+                stable_elapsed = (
+                    now - self._platform_low_stable_start_time
+                ).nanoseconds / 1e9
+                if stable_elapsed >= self.platform_low_hover_stable_sec:
+                    self._platform_low_stable_start_time = None
+                    self.get_logger().info(
+                        f"Platform final hover stable at clearance={clearance:.2f}m "
+                        f"flow_q={flow_state['quality']}; waiting for grasp"
+                    )
+                    self._publish_event("platform_final_hover_reached")
+                    self._transition(Phase.WAIT_GRASP)
+                    return
+            else:
+                self._platform_low_stable_start_time = None
+            self.get_logger().info(
+                f"Platform final hover: clearance={clearance:.2f}/"
+                f"{self.platform_grasp_clearance_m:.2f}m "
+                f"flow_q={flow_state['quality']} cmd_body=(0.00,0.00,{vz:.2f})",
+                throttle_duration_sec=0.5,
+            )
+            return
+
         self._publish_velocity(0.0, 0.0, 0.0)
         self._check_stable_and_transition(
             Phase.WAIT_GRASP, "Final hover stable, waiting for grasp", "final_hover_reached"
         )
 
     def _tick_wait_grasp(self):
-        self._publish_velocity(0.0, 0.0, 0.0)
+        if self._platform_locked:
+            range_state = self._platform_range_state()
+            flow_state = self._platform_flow_state()
+            if not range_state["ready"] or not flow_state["ready"]:
+                self._platform_hold_sensor_failure(
+                    "Platform grasp wait", range_state, flow_state
+                )
+                return
+            self._platform_sensor_loss_start_time = None
+            clearance = range_state["clearance"]
+            alt_err = self.platform_grasp_clearance_m - clearance
+            vz = clamp(
+                self.kp_vertical * alt_err,
+                -self.platform_descend_max_speed_mps,
+                self.platform_descend_max_speed_mps,
+            )
+            self._publish_velocity(0.0, 0.0, vz, frame_id="body", immediate=True)
+            self.get_logger().info(
+                f"Platform grasp wait hold: clearance={clearance:.2f}/"
+                f"{self.platform_grasp_clearance_m:.2f}m "
+                f"flow_q={flow_state['quality']} cmd_body=(0.00,0.00,{vz:.2f})",
+                throttle_duration_sec=1.0,
+            )
+        else:
+            self._publish_velocity(0.0, 0.0, 0.0)
         if self._is_uwb_grasp_return_land_mode():
             self._publish_grasp_command_once()
         if self.fake_grasp:
@@ -3325,10 +4217,18 @@ class TestMissionNode(Node):
 
         elapsed = (self.get_clock().now() - self.grasp_start_time).nanoseconds / 1e9
         if elapsed >= self.grasp_timeout_sec:
-            self.get_logger().error(f"grasp_done timeout after {elapsed:.1f}s, entering FAILSAFE")
-            self._publish_event("grasp_timeout")
-            self._publish_velocity(0.0, 0.0, 0.0)
-            self._transition(Phase.FAILSAFE)
+            if self._platform_locked:
+                self._publish_event("grasp_timeout")
+                self._platform_start_abort(
+                    f"grasp_done timeout after {elapsed:.1f}s"
+                )
+            else:
+                self.get_logger().error(
+                    f"grasp_done timeout after {elapsed:.1f}s, entering FAILSAFE"
+                )
+                self._publish_event("grasp_timeout")
+                self._publish_velocity(0.0, 0.0, 0.0)
+                self._transition(Phase.FAILSAFE)
             return
 
         self.get_logger().info("Waiting for grasp_done signal...", throttle_duration_sec=2.0)
@@ -3444,6 +4344,22 @@ class TestMissionNode(Node):
             self.hover_start_time = None
 
     def _tick_hover_return(self):
+        if self._platform_compensation_active:
+            range_state = self._platform_range_state()
+            if (
+                range_state["ready"]
+                and range_state["clearance"] >= self.platform_exit_range_threshold_m
+            ):
+                self._platform_clear_compensation("home hover floor range")
+            else:
+                self._takeoff_land_abort_reason = (
+                    "Returned home while platform compensation remained active"
+                )
+                self.get_logger().error(
+                    f"{self._takeoff_land_abort_reason}; entering FAILSAFE"
+                )
+                self._transition(Phase.FAILSAFE)
+                return
         self._publish_velocity(0.0, 0.0, 0.0)
         if self.enable_drop_stage:
             self._check_stable_and_transition(
@@ -3523,7 +4439,14 @@ class TestMissionNode(Node):
             self._land_disarm_sent = False
             self._land_disarm_retry_count = 0
 
-        rel_alt, source = self._get_takeoff_land_relative_altitude()
+        if self._platform_compensation_active:
+            range_state = self._platform_range_state()
+            rel_alt = (
+                range_state["clearance"] if range_state["ready"] else None
+            )
+            source = "platform_surface"
+        else:
+            rel_alt, source = self._get_takeoff_land_relative_altitude()
         alt_text = "rel_alt=missing"
         if rel_alt is not None:
             alt_text = f"rel_alt={rel_alt:.2f}m ({source})"
@@ -3734,6 +4657,7 @@ class TestMissionNode(Node):
         if new_phase != Phase.HOVER_ABOVE:
             self._uwb_preland_stable_start_time = None
             self._uwb_preland_timeout_hold_start_time = None
+            self._platform_verify_only_start_time = None
         if new_phase != Phase.TAKEOFF:
             self._takeoff_wait_start_time = None
             self._takeoff_delay_start_time = None
@@ -3748,7 +4672,12 @@ class TestMissionNode(Node):
             self._uwb_capture_start_time = None
             self._uwb_capture_mode = None
             self._uwb_front_start_time = None
-            if new_phase not in (Phase.UWB_SCAN_YAW, Phase.HOVER_ABOVE, Phase.LAND):
+            if new_phase not in (
+                Phase.UWB_SCAN_YAW,
+                Phase.HOVER_ABOVE,
+                Phase.PLATFORM_VERIFY,
+                Phase.LAND,
+            ):
                 self._uwb_front_stable_once = False
                 self._uwb_front_line_locked = False
                 self._uwb_region_samples = []
@@ -3769,6 +4698,15 @@ class TestMissionNode(Node):
                 self._waypoint_target_xy = None
         if new_phase != Phase.WAYPOINT_RETURN:
             self._waypoint_return_start_time = None
+        if new_phase != Phase.PLATFORM_VERIFY:
+            self._platform_verify_start_time = None
+        if new_phase != Phase.PLATFORM_EXIT_VERIFY:
+            self._platform_exit_start_time = None
+            self._platform_exit_stable_start_time = None
+        if new_phase not in (Phase.DESCEND, Phase.HOVER_FINAL):
+            self._platform_low_stable_start_time = None
+        if new_phase != Phase.ABORT_RETURN:
+            self._platform_abort_alt_stable_start_time = None
         if new_phase != Phase.LAND_WAIT:
             self._land_wait_start_time = None
             self._land_ground_start_time = None
@@ -4106,7 +5044,7 @@ class TestMissionNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = TestMissionNode()
+    node = PlatformMissionNode()
     try:
         while rclpy.ok() and not node.should_exit():
             rclpy.spin_once(node, timeout_sec=0.1)

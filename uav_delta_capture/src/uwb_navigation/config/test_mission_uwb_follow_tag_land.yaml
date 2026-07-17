@@ -1,0 +1,78 @@
+test_mission_node:
+  ros__parameters:
+    uwb_aoa_topic: uwb_aoa/data
+    fcu_state_topic: fcu_state
+    local_pose_topic: /mavros/local_position/pose
+    mavros_state_topic: /mavros/state
+    rangefinder_topic: /mavros/rangefinder_pub
+    optical_flow_topic: /mavros/optical_flow/raw/optical_flow
+    fcu_link_topic: fcu_link/status
+    cmd_vel_topic: cmd_vel
+    mission_state_topic: test_mission/state
+    mission_event_topic: test_mission/event
+    flight_command_service: flight_command
+
+    mission_mode: uwb_follow_tag_land
+    use_mock: false
+    desktop_test: false
+    arm_mode: ALT_HOLD
+
+    takeoff_altitude: 0.85
+    takeoff_method: mavros
+    takeoff_climb_velocity: 0.12
+    takeoff_mavros_assist_enabled: true
+    takeoff_mavros_assist_delay_sec: 2.5
+    takeoff_command_delay_sec: 1.5
+    takeoff_height_timeout_sec: 25.0
+    takeoff_transition_tolerance: 0.12
+    descend_altitude: 0.60
+    hover_stable_time: 2.0
+    max_vel_xy: 0.15
+    max_vel_z: 0.15
+    velocity_slew_rate: 0.2
+    altitude_tolerance: 0.12
+    control_rate_hz: 20.0
+    land_ground_rel_alt_threshold: 0.12
+    land_ground_stable_sec: 1.5
+    land_wait_timeout_sec: 12.0
+
+    kp_horizontal: 0.25
+    kp_vertical: 0.25
+    uwb_azimuth_offset_deg: 0.0
+    uwb_mount_pitch_down_deg: -45.0
+    uwb_forward_sign: 1.0
+    uwb_lateral_sign: -1.0
+    uwb_region_classifier_enabled: true
+    uwb_region_window_sec: 0.4
+    uwb_min_body_elevation_deg: 8.0
+    uwb_approach_front_sector_deg: 65.0
+    uwb_front_line_lock_deg: 15.0
+    uwb_front_stable_sec: 0.5
+    uwb_slow_radius_m: 1.0
+    uwb_slow_max_vel_xy: 0.04
+    uwb_scan_yaw_rate_deg_s: 12.0
+    uwb_scan_timeout_sec: 30.0
+    uwb_scan_lock_front_sector_deg: 15.0
+    uwb_scan_lock_stable_sec: 0.5
+    uwb_scan_settle_sec: 0.5
+    uwb_missing_timeout_sec: 3.0
+
+    follow_timeout_sec: 60.0
+    follow_center_radius_m: 0.10
+    follow_quiet_speed_mps: 0.02
+    follow_stationary_sec: 5.0
+    follow_front_loss_sec: 2.0
+
+    mission_soft_radius_m: 2.0
+    mission_hard_radius_m: 2.5
+
+    require_uwb_ready: true
+    require_local_pose_ready: true
+    uwb_signal_timeout: 3.0
+    local_pose_timeout: 1.0
+    bench_sensor_timeout: 2.0
+    low_battery_pct: 20.0
+    recovery_timeout: 3.0
+    set_mode_service_timeout_sec: 8.0
+    mode_confirm_timeout_sec: 8.0
+    auto_modes: GUIDED

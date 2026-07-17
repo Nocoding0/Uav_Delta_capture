@@ -146,12 +146,6 @@ class TestMissionNode(Node):
         self.descend_altitude = self.declare_parameter("descend_altitude", 0.5).value
         self.takeoff_method = self.declare_parameter("takeoff_method", "mavros").value
         self.takeoff_climb_velocity = self.declare_parameter("takeoff_climb_velocity", 0.12).value
-        self.takeoff_mavros_assist_enabled = self.declare_parameter(
-            "takeoff_mavros_assist_enabled", False
-        ).value
-        self.takeoff_mavros_assist_delay_sec = self.declare_parameter(
-            "takeoff_mavros_assist_delay_sec", 2.5
-        ).value
         self.takeoff_command_delay_sec = self.declare_parameter(
             "takeoff_command_delay_sec", 1.5
         ).value
@@ -389,10 +383,6 @@ class TestMissionNode(Node):
             self.takeoff_method = "mavros"
         self.takeoff_climb_velocity = clamp(
             abs(float(self.takeoff_climb_velocity)), 0.03, 0.25
-        )
-        self.takeoff_mavros_assist_enabled = bool(self.takeoff_mavros_assist_enabled)
-        self.takeoff_mavros_assist_delay_sec = max(
-            0.0, float(self.takeoff_mavros_assist_delay_sec)
         )
         self.takeoff_command_delay_sec = max(0.0, float(self.takeoff_command_delay_sec))
         self.takeoff_height_timeout_sec = max(1.0, float(self.takeoff_height_timeout_sec))
@@ -654,7 +644,6 @@ class TestMissionNode(Node):
         self._takeoff_wait_start_time = None
         self._takeoff_delay_start_time = None
         self._takeoff_climb_start_time = None
-        self._takeoff_mavros_assist_started = False
         self._loiter_alt_loss_start_time = None
         self._move_above_start_time = None
         self._uwb_missing_start_time = None
@@ -740,8 +729,6 @@ class TestMissionNode(Node):
             f"mock={str(self.use_mock).lower()} "
             f"takeoff={self.takeoff_altitude:.1f}m descend={self.descend_altitude:.1f}m "
             f"takeoff_method={self.takeoff_method} "
-            f"mavros_assist={str(self.takeoff_mavros_assist_enabled).lower()} "
-            f"assist_delay={self.takeoff_mavros_assist_delay_sec:.1f}s "
             f"takeoff_delay={self.takeoff_command_delay_sec:.1f}s "
             f"drop_stage={str(self.enable_drop_stage).lower()}"
         )
@@ -1780,14 +1767,18 @@ class TestMissionNode(Node):
         takeoff_command_altitude = float(self.takeoff_altitude)
         if self._is_takeoff_land_mode():
             current_local_z = self._get_local_z()
-            current_local_z_text = (
-                "none" if current_local_z is None else f"{current_local_z:.2f}m"
-            )
+            if not self.origin_z_available or current_local_z is None:
+                reason = "TAKEOFF blocked: local altitude origin is unavailable"
+                self.get_logger().error(reason)
+                self._takeoff_land_abort_reason = reason
+                self._transition(Phase.FAILSAFE)
+                return
+
+            takeoff_command_altitude = self.origin_z + float(self.takeoff_altitude)
             self.get_logger().info(
-                f"Requesting MAVROS relative takeoff: target_rel="
-                f"{self.takeoff_altitude:.2f}m "
-                f"service_relative_target={takeoff_command_altitude:.2f}m "
-                f"current_local_z_diagnostic={current_local_z_text} "
+                f"Requesting MAVROS relative takeoff: requested_rel="
+                f"{self.takeoff_altitude:.2f}m service_target={takeoff_command_altitude:.2f}m "
+                f"current_local_z={current_local_z:.2f}m "
                 f"{self._format_takeoff_altitude_diagnostics(0.0)}"
             )
 
@@ -1921,26 +1912,6 @@ class TestMissionNode(Node):
                     f"Velocity takeoff climbing: rel_alt={rel_alt:.2f}/"
                     f"{self.takeoff_altitude:.2f}m ({source}) "
                     f"vz={self.takeoff_climb_velocity:.2f}m/s",
-                    throttle_duration_sec=1.0,
-                )
-                return
-
-            if (
-                self.takeoff_mavros_assist_enabled
-                and climb_elapsed >= self.takeoff_mavros_assist_delay_sec
-            ):
-                if not self._takeoff_mavros_assist_started:
-                    self._takeoff_mavros_assist_started = True
-                    self._publish_event("takeoff_mavros_assist_started")
-                    self.get_logger().warn(
-                        "MAVROS takeoff height is below the transition threshold; "
-                        "starting measured-height velocity assist"
-                    )
-                self._publish_velocity(0.0, 0.0, self.takeoff_climb_velocity)
-                self.get_logger().info(
-                    f"MAVROS takeoff assist climbing: rel_alt={rel_alt:.2f}/"
-                    f"{self.takeoff_altitude:.2f}m threshold={takeoff_ready_alt:.2f}m "
-                    f"({source}) vz={self.takeoff_climb_velocity:.2f}m/s",
                     throttle_duration_sec=1.0,
                 )
                 return

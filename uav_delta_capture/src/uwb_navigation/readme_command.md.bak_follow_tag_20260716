@@ -527,31 +527,3 @@ timeout 3 dd if=/dev/ttyUSB0 bs=1 count=128 status=none | od -An -tx1
     /workspace/uav_delta_capture/install/uwb_navigation/share/uwb_navigation/test_mission_uwb_grasp_return_land.yaml
   "
 ```
-
-## 5.3 UWB Follow Tag Then Land
-
-Purpose: prop-on test for following a ground tag dragged slowly by a rope.
-The aircraft takes off to 0.85m, scans if the tag is not in front, follows the
-tag with 2D BODY_NED velocity, waits for a 5.0s stable near-center relationship,
-descends to 0.60m, then LANDs. It does not grasp, return, or drop. The existing
-2.0m soft radius and 2.5m hard radius remain active.
-
-```bash
-docker exec -it ros2humble bash -lc "
-  source /opt/ros/humble/setup.bash
-  source /workspace/uav_delta_capture/install/setup.bash
-  ros2 launch uwb_navigation test_mission_uwb_follow_tag_land.launch.py
-"
-```
-
-Key logs:
-
-```text
-UWB follow target locked ... starting 2D follow
-UWB follow BODY_NED ...
-UWB follow near-center candidate ...
-UWB follow stationary candidate ...
-UWB follow tag stationary confirmed ... descending before LAND
-UWB follow low hover stable ... landing
-UWB_FOLLOW_TAG_LAND RESULT: PASS
-```

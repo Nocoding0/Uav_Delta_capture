@@ -34,7 +34,6 @@ public:
     mavros_vel_topic_(declare_parameter<std::string>("mavros_vel_topic", "/mavros/setpoint_velocity/cmd_vel")),
     mavros_takeoff_topic_(declare_parameter<std::string>("mavros_takeoff_topic", "/mavros/cmd/takeoff")),
     takeoff_target_clearance_m_(declare_parameter<double>("takeoff_target_clearance_m", 0.2)),
-    takeoff_max_altitude_m_(declare_parameter<double>("takeoff_max_altitude_m", 3.0)),
     vel_forward_rate_hz_(declare_parameter<double>("vel_forward_rate_hz", 20.0)),
     vel_timeout_sec_(declare_parameter<double>("vel_timeout_sec", 0.5)),
     use_mock_(declare_parameter<bool>("use_mock", false)),
@@ -48,8 +47,6 @@ public:
     max_vel_xy_ = std::max(0.1, max_vel_xy_);
     max_vel_z_ = std::max(0.1, max_vel_z_);
     takeoff_target_clearance_m_ = std::max(0.05, takeoff_target_clearance_m_);
-    takeoff_max_altitude_m_ = std::max(
-      takeoff_target_clearance_m_, takeoff_max_altitude_m_);
     last_vel_time_ = now();
 
     // Use a reentrant callback group so async service calls from within
@@ -98,11 +95,9 @@ public:
 
     RCLCPP_INFO(
       get_logger(),
-      "flight_commander_node started: service=%s mock=%s max_vel_xy=%.1f max_vel_z=%.1f "
-      "vel_timeout=%.2fs skip_ekf=%s takeoff_relative_range=[%.2f,%.2f]m",
+      "flight_commander_node started: service=%s mock=%s max_vel_xy=%.1f max_vel_z=%.1f vel_timeout=%.2fs skip_ekf=%s",
       service_topic_.c_str(), use_mock_ ? "true" : "false", max_vel_xy_, max_vel_z_,
-      vel_timeout_sec_, skip_ekf_check_ ? "true" : "false",
-      takeoff_target_clearance_m_, takeoff_max_altitude_m_);
+      vel_timeout_sec_, skip_ekf_check_ ? "true" : "false");
   }
 
 private:
@@ -274,30 +269,17 @@ private:
       return;
     }
 
-    if (!std::isfinite(altitude) || altitude <= 0.0f) {
-      response->success = false;
-      response->message = "invalid relative takeoff altitude";
-      RCLCPP_ERROR(
-        get_logger(), "Takeoff rejected before MAVROS: invalid relative request %.3fm",
-        altitude);
-      return;
+    if (altitude <= 0.0f) {
+      altitude = 1.0f;  // default 1m
     }
 
-    if (altitude > static_cast<float>(takeoff_max_altitude_m_)) {
-      response->success = false;
-      response->message = "relative takeoff altitude exceeds configured maximum";
-      RCLCPP_ERROR(
-        get_logger(),
-        "Takeoff rejected before MAVROS: relative request %.2fm exceeds max %.2fm",
-        altitude, takeoff_max_altitude_m_);
-      return;
-    }
-
-    const float target_altitude = std::max(
-      altitude, static_cast<float>(takeoff_target_clearance_m_));
+    float target_altitude = altitude;
     float current_local_z = 0.0f;
     if (has_state_ && last_state_) {
-      current_local_z = last_state_->local_z;
+      current_local_z = std::max(0.0f, last_state_->local_z);
+      target_altitude = std::max(
+        target_altitude,
+        current_local_z + static_cast<float>(takeoff_target_clearance_m_));
     }
 
     // Switch to GUIDED mode (fire-and-forget, don't block)
@@ -334,14 +316,11 @@ private:
         auto result = future.get();
         response->success = result->success;
         response->message = result->success
-          ? ("relative takeoff to " + std::to_string(altitude) +
-            "m accepted (service_target=" +
+          ? ("takeoff to " + std::to_string(altitude) + "m accepted (service_target=" +
             std::to_string(target_altitude) + "m)")
           : "takeoff command rejected by FCU";
         RCLCPP_INFO(
-          get_logger(),
-          "Takeoff(relative_request=%.2fm service_target=%.2fm "
-          "current_local_z_diagnostic=%.2fm) result: %s",
+          get_logger(), "Takeoff(request=%.1fm service_target=%.2fm current_local_z=%.2fm) result: %s",
           altitude, target_altitude, current_local_z, response->message.c_str());
         {
           std::lock_guard<std::mutex> lk(mtx);
@@ -456,7 +435,6 @@ private:
   std::string mavros_vel_topic_;
   std::string mavros_takeoff_topic_;
   double takeoff_target_clearance_m_;
-  double takeoff_max_altitude_m_;
   double vel_forward_rate_hz_;
   double vel_timeout_sec_;
   bool use_mock_;
